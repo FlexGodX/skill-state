@@ -12,4 +12,6 @@ results are safe to retain; identity and status metadata are the default.
 
 Hook failures return `{"decision":"allow"}` so an unavailable observation sink cannot block a
 session or tool call. Model requests still need a provider configured through the gateway templates
-under `integrations/`; the hooks do not bypass provider interception.
+under `integrations/`; the hooks do not bypass provider interception. The current Codex hook seam has
+no verified outbound custom-provider request hook, so it cannot inject `x-skill-state-session`; use an
+adapter with a runtime session ID when that header is required.

@@ -12,7 +12,7 @@ import yaml
 
 
 ROOT = Path(__file__).resolve().parents[2]
-PLUGIN = ROOT / "plugin" / "skill-state"
+PLUGIN = ROOT / "plugins" / "skill-state"
 MANIFEST = PLUGIN / ".codex-plugin" / "plugin.json"
 SKILL = PLUGIN / "skills" / "skill-state" / "SKILL.md"
 HOOKS = PLUGIN / "hooks" / "hooks.json"

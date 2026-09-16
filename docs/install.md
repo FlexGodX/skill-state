@@ -144,8 +144,11 @@ const dispose = applySkillStateLlmPlugin(ctx, {
 The host must already provide `@deepseek-ai/dsh-llm` and
 `@deepseek-ai/cordis`; the patchable package declares peer dependencies and
 does not install or modify them. The adapter fails closed when the gateway URL
-is missing or invalid, so a configured route cannot silently fall back to a
-direct provider. See the [Harness integration note](../integrations/deepseek-harness/README.md).
+is missing or invalid, or when `GenerateOptions.sessionId` is absent, so a
+configured route cannot silently fall back to a direct provider. The stable
+runtime session ID is sent as `x-skill-state-session` and `session_id`; tool
+results remain in the top-level `tool_result` body field for gateway `O`
+extraction. See the [Harness integration note](../integrations/deepseek-harness/README.md).
 
 ## OpenCode provider and hooks
 
@@ -153,8 +156,10 @@ Copy [`integrations/opencode/opencode.provider.json`](../integrations/opencode/o
 into a repository-local OpenCode configuration and update the relative plugin
 path if the fragment moves. It uses `@ai-sdk/openai-compatible` with
 `http://127.0.0.1:8787/v1`, so the model route remains gateway-backed. The
-plugin records session and tool metadata and adds a routing header; tool
-arguments and results are not retained by default.
+plugin records session and tool metadata and adds routing headers from the
+actual OpenCode `chat.headers` input `sessionID`; tool messages/results remain
+in the provider request body and tool arguments/results are not retained by
+the observation sink by default.
 
 Set `SKILL_STATE_GATEWAY_API_KEY` in the process environment when required.
 Do not edit `~/.config/opencode` as part of installing this repository fragment.
@@ -162,11 +167,31 @@ See the [OpenCode integration note](../integrations/opencode/README.md).
 
 ## Codex plugin hooks
 
-The plugin scaffold is under [`plugin/skill-state`](../plugin/skill-state/).
-Its manifest intentionally contains no unsupported `hooks` field. The host
-discovers [`hooks/hooks.json`](../plugin/skill-state/hooks/hooks.json), which
+The repository marketplace is under [`.agents/plugins/marketplace.json`](../.agents/plugins/marketplace.json),
+and the plugin scaffold is under [`plugins/skill-state`](../plugins/skill-state/). To install it from a
+checkout without editing a user configuration file by hand, run these commands from the repository's
+parent directory:
+
+```sh
+codex plugin marketplace add ./skill-state
+codex plugin add skill-state@skill-state
+```
+
+For the published GitHub marketplace, use the repository source directly:
+
+```sh
+codex plugin marketplace add FlexGodX/skill-state --ref main
+codex plugin add skill-state@skill-state
+```
+
+Verify the resolved entry with `codex plugin list`. The marketplace entry points at
+`./plugins/skill-state`, and its manifest contains no unsupported `hooks` field.
+
+The host discovers [`hooks/hooks.json`](../plugins/skill-state/hooks/hooks.json), which
 registers `SessionStart`, `SessionEnd`, `PreToolUse`, and `PostToolUse`
 observation commands. The default sink is `.skill-state/observations.ndjson`.
+These lifecycle hooks do not have verified access to outbound Codex custom-provider request headers,
+so they cannot provide `x-skill-state-session` or replace the adapter/provider interception path.
 
 Set `SKILL_STATE_OBSERVATION_SINK` to an explicit file or HTTPS endpoint only
 when the deployment owns that sink. Set

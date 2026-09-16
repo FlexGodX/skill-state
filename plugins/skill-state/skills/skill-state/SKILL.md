@@ -16,9 +16,11 @@ canonical prompt from its core state boundary and the latest observation.
 
 ## Add observations
 
-Install the companion hooks from `plugin/skill-state/hooks/`. They record session and tool lifecycle
+Install the companion hooks from `plugins/skill-state/hooks/`. They record session and tool lifecycle
 events as metadata and allow an optional observation sink. Tool payload capture is opt-in; leave it
-disabled when arguments or results can contain sensitive data.
+disabled when arguments or results can contain sensitive data. The Codex hook seam does not currently
+provide verified access to outbound custom-provider requests, so these hooks cannot add the
+`x-skill-state-session` provider header; configure provider interception separately.
 
 ## Verify the connection
 

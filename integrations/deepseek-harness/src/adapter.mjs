@@ -52,7 +52,15 @@ export class SkillStateLlmAdapter extends LlmAdapter {
   }
 
   async *stream(options) {
-    const request = buildGatewayRequest(options, this.config)
+    let request
+    try {
+      request = buildGatewayRequest(options, this.config)
+    } catch (error) {
+      if (error instanceof TypeError && error.message.includes('stable non-empty sessionId')) {
+        throw new LlmError(error.message, 'INVALID_SESSION', { cause: error })
+      }
+      throw error
+    }
     const response = await fetch(request.url, {
       method: 'POST',
       headers: request.headers,

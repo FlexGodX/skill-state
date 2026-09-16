@@ -22,9 +22,11 @@ names identify compatibility seams only.
   resolves the trusted procedure at startup, receives only the latest
   observation at the core boundary, sends one canonical prompt upstream, and
   accepts only a validated `{state_patch, action}` response.
-- `plugin/skill-state` contains the Codex-compatible plugin scaffold and
+- `plugins/skill-state` contains the Codex-compatible plugin scaffold and
   companion hooks. Hooks record session and tool observations; they do not
   bypass the gateway.
+- `.agents/plugins/marketplace.json` registers the plugin as a repo-local
+  Codex marketplace entry.
 - `integrations/` contains patchable configuration and adapter seams for the
   Codex CLI custom provider, DeepSeek Harness `LlmAdapter`/`LlmRuntime`, and
   OpenCode provider/plugin hooks.

@@ -4,8 +4,10 @@ import assert from 'node:assert/strict'
 import {
   buildGatewayRequest,
   latestObservationFromMessages,
+  latestToolResultFromMessages,
   mapFinishReason,
   normalizeConfig,
+  stableSessionId,
   usageFromProvider,
 } from '../src/protocol.mjs'
 
@@ -25,6 +27,7 @@ test('builds a request with latest observation and no transcript fields', () => 
   const request = buildGatewayRequest({
     provider: 'skill-state',
     model: 'state-model',
+    sessionId: 'dsh-session-1',
     temperature: 0.2,
     messages: [{ role: 'user', content: [{ type: 'text', text: 'hello' }] }],
     system: 'must stay outside the gateway request',
@@ -32,10 +35,49 @@ test('builds a request with latest observation and no transcript fields', () => 
   }, normalizeConfig({ gatewayBaseUrl: 'http://127.0.0.1:8787/v1' }))
 
   assert.equal(request.url, 'http://127.0.0.1:8787/v1/chat/completions')
+  assert.equal(request.headers['x-skill-state-session'], 'dsh-session-1')
+  assert.equal(request.body.session_id, 'dsh-session-1')
   assert.equal(request.body.latest_observation.content[0].text, 'hello')
   assert.equal('messages' in request.body, false)
   assert.equal('system' in request.body, false)
   assert.equal('tools' in request.body, false)
+})
+
+test('isolates requests by stable session header without a generated fallback', () => {
+  const config = normalizeConfig({ gatewayBaseUrl: 'http://127.0.0.1:8787/v1' })
+  const first = buildGatewayRequest({ sessionId: 'session-a', messages: [] }, config)
+  const second = buildGatewayRequest({ sessionId: 'session-b', messages: [] }, config)
+  assert.equal(first.headers['x-skill-state-session'], 'session-a')
+  assert.equal(second.headers['x-skill-state-session'], 'session-b')
+  assert.equal(first.body.session_id, 'session-a')
+  assert.equal(second.body.session_id, 'session-b')
+  assert.throws(() => stableSessionId({}), /stable non-empty sessionId/)
+  assert.throws(() => buildGatewayRequest({ messages: [] }, config), /stable non-empty sessionId/)
+})
+
+test('keeps the newest tool result as a top-level gateway observation', () => {
+  const toolResult = {
+    type: 'tool-result',
+    toolCallId: 'call-1',
+    content: [{ type: 'text', text: 'done' }],
+    isError: false,
+  }
+  const messages = [{ role: 'user', content: [toolResult] }]
+  const request = buildGatewayRequest({ sessionId: 'session-tools', messages }, normalizeConfig({
+    gatewayBaseUrl: 'http://127.0.0.1:8787/v1',
+  }))
+  assert.deepEqual(latestToolResultFromMessages(messages), {
+    type: 'tool-result',
+    tool_call_id: 'call-1',
+    content: [{ type: 'text', text: 'done' }],
+    is_error: false,
+  })
+  assert.deepEqual(request.body.tool_result, {
+    type: 'tool-result',
+    tool_call_id: 'call-1',
+    content: [{ type: 'text', text: 'done' }],
+    is_error: false,
+  })
 })
 
 test('maps usage and terminal finish reasons', () => {

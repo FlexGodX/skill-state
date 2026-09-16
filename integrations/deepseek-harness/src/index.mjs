@@ -1,5 +1,5 @@
 import { SkillStateLlmAdapter } from './adapter.mjs'
-import { latestObservationFromMessages, normalizeConfig } from './protocol.mjs'
+import { latestObservationFromMessages, normalizeConfig, stableSessionId } from './protocol.mjs'
 
 export { SkillStateLlmAdapter } from './adapter.mjs'
 export * from './protocol.mjs'
@@ -24,6 +24,7 @@ export function applySkillStateLlmPlugin(ctx, config) {
   const registration = registerSkillStateAdapter(ctx.llm, normalized)
   const observe = typeof config.onObservation === 'function' ? config.onObservation : undefined
   const disposeObservation = ctx.on('llm/stream', async function* (options, next) {
+    const sessionId = stableSessionId(options)
     if (observe !== undefined) {
       try {
         await observe({
@@ -31,7 +32,7 @@ export function applySkillStateLlmPlugin(ctx, config) {
           provider: options.provider,
           model: options.model,
           latestObservation: latestObservationFromMessages(options.messages),
-          sessionId: options.sessionId,
+          sessionId,
           purpose: options.purpose,
         })
       } catch {

@@ -18,7 +18,7 @@
     "test": "npm run test:core && npm run test:gateway && npm run test:integrations && npm run test:bench",
     "test:core": "tsx --test packages/core/test/*.test.ts",
     "test:gateway": "node --test packages/gateway/test/*.test.mjs",
-    "test:integrations": "node --test integrations/deepseek-harness/test/*.test.mjs integrations/opencode/test/*.test.mjs plugin/skill-state/test/*.test.mjs",
+    "test:integrations": "node --test integrations/deepseek-harness/test/*.test.mjs integrations/opencode/test/*.test.mjs plugins/skill-state/test/*.test.mjs",
     "test:bench": "node --test packages/bench/test/*.test.mjs",
     "typecheck": "tsc --noEmit && npm --workspace @skill-state/gateway run typecheck && npm --workspace skill-state-bench run typecheck",
     "typecheck:core": "tsc --noEmit --project packages/core/tsconfig.json"

@@ -6,6 +6,20 @@ function nonEmptyString(value, field) {
   return value.trim()
 }
 
+/**
+ * Return the runtime session identity used to isolate gateway state.
+ * DeepSeek Harness exposes this as GenerateOptions.sessionId; there is no
+ * safe request-local fallback because a generated id would split one agent
+ * session across unrelated state cursors.
+ */
+export function stableSessionId(options) {
+  const sessionId = options?.sessionId
+  if (typeof sessionId !== 'string' || sessionId.trim() === '') {
+    throw new TypeError('LLM options must include a stable non-empty sessionId')
+  }
+  return sessionId.trim()
+}
+
 function projectBlock(block) {
   if (!block || typeof block !== 'object' || typeof block.type !== 'string') return { type: 'unknown' }
   switch (block.type) {
@@ -43,6 +57,18 @@ export function latestObservationFromMessages(messages) {
     role: typeof message.role === 'string' ? message.role : 'unknown',
     content: Array.isArray(message.content) ? message.content.map(projectBlock) : [],
   }
+}
+
+/** Project the newest tool result separately for the gateway observation extractor. */
+export function latestToolResultFromMessages(messages) {
+  if (!Array.isArray(messages)) return undefined
+  for (const message of [...messages].reverse()) {
+    if (!message || typeof message !== 'object' || !Array.isArray(message.content)) continue
+    for (const block of [...message.content].reverse()) {
+      if (block?.type === 'tool-result') return projectBlock(block)
+    }
+  }
+  return undefined
 }
 
 function gatewayEndpoint(baseUrl) {
@@ -84,20 +110,28 @@ function addControl(controls, key, value) {
 export function buildGatewayRequest(options, config) {
   const normalized = normalizeConfig(config)
   if (!options || typeof options !== 'object') throw new TypeError('LLM options must be an object')
+  const sessionId = stableSessionId(options)
+  const toolResult = latestToolResultFromMessages(options.messages)
   const controls = {}
   addControl(controls, 'temperature', options.temperature)
   addControl(controls, 'max_tokens', options.maxTokens)
   addControl(controls, 'stop', Array.isArray(options.stop) ? [...options.stop] : undefined)
   addControl(controls, 'reasoning_effort', options.reasoningEffort)
   addControl(controls, 'purpose', options.purpose)
-  const headers = { accept: 'text/event-stream, application/json', 'content-type': 'application/json' }
+  const headers = {
+    accept: 'text/event-stream, application/json',
+    'content-type': 'application/json',
+    'x-skill-state-session': sessionId,
+  }
   if (normalized.apiKey !== undefined) headers.authorization = `Bearer ${normalized.apiKey}`
   return {
     url: gatewayEndpoint(normalized.gatewayBaseUrl).toString(),
     headers,
     body: {
       model: typeof options.model === 'string' && options.model.length > 0 ? options.model : normalized.model,
+      session_id: sessionId,
       latest_observation: latestObservationFromMessages(options.messages),
+      ...(toolResult === undefined ? {} : { tool_result: toolResult }),
       stream: true,
       controls,
     },

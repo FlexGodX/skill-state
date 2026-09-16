@@ -9,6 +9,14 @@ function firstString(...values) {
   return values.find(value => typeof value === 'string' && value.length > 0)
 }
 
+function requiredSessionId(input) {
+  const sessionID = input?.sessionID
+  if (typeof sessionID !== 'string' || sessionID.trim() === '') {
+    throw new Error('skill-state: OpenCode chat.headers requires a non-empty input.sessionID')
+  }
+  return sessionID.trim()
+}
+
 function shouldObserve(eventType) {
   return typeof eventType === 'string'
     && (eventType.startsWith('session.') || eventType.includes('tool'))
@@ -101,9 +109,17 @@ export const SkillStatePlugin = async () => {
         phase: 'after',
       }))
     },
-    'chat.headers': async (_input, output) => {
-      // This metadata is safe to expose and makes gateway routing inspectable.
+    'chat.headers': async (input, output) => {
+      const sessionID = requiredSessionId(input)
+      if (!output || typeof output.headers !== 'object' || output.headers === null) {
+        throw new Error('skill-state: OpenCode chat.headers requires output.headers')
+      }
+      // OpenCode owns the provider request body, including serialized tool
+      // results. This hook only adds routing metadata and never moves results
+      // into headers or the observation sink, so gateway O extraction remains
+      // body-backed.
       output.headers['x-skill-state-provider'] = PROVIDER_ID
+      output.headers['x-skill-state-session'] = sessionID
     },
   }
 }

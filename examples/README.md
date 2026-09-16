@@ -25,7 +25,7 @@ startup environment or constructor; `procedureFile` is not an adapter option. Af
 commits a model patch and records an action, the host executes that action and sends its result as
 `action_result` or `tool_result` on the next model request.
 
-The companion Codex plugin under `plugin/skill-state/` records session and tool observations. The
+The companion Codex plugin under `plugins/skill-state/` records session and tool observations. The
 client provider must still point at the gateway so state updates go through the mandatory interception
 path.
 
