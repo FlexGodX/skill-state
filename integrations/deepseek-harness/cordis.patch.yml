@@ -1,0 +1,10 @@
+# Optional DSH profile layer. It registers the session-bound adapter without
+# changing the host's existing provider or default model selection.
+- insert:
+    - id: skill-state-llm
+      name: '@skill-state/deepseek-harness-adapter'
+      config:
+        provider: !!js process.env.SKILL_STATE_PROVIDER || 'skill-state'
+        model: !!js process.env.SKILL_STATE_MODEL || 'state-model'
+        gatewayBaseUrl: !!js process.env.SKILL_STATE_GATEWAY_URL || 'http://127.0.0.1:8787/v1'
+        apiKeyEnv: SKILL_STATE_GATEWAY_API_KEY

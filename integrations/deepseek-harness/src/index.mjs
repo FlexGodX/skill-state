@@ -4,6 +4,10 @@ import { latestObservationFromMessages, normalizeConfig, stableSessionId } from 
 export { SkillStateLlmAdapter } from './adapter.mjs'
 export * from './protocol.mjs'
 
+// Cordis injects the live LlmRuntime before invoking this plugin. Without the
+// declaration, the profile loader fails closed rather than exposing a route.
+export const inject = ['llm']
+
 /**
  * Register the adapter on the real DeepSeek Harness LlmRuntime seam.
  * @param {import('@deepseek-ai/dsh-llm').LlmRuntime} runtime - live `ctx.llm` service.
@@ -46,5 +50,9 @@ export function applySkillStateLlmPlugin(ctx, config) {
     registration()
   }
 }
+
+// The loader resolves a default-exported plugin as the function itself, so
+// retain the injection metadata on that function as well as the named export.
+applySkillStateLlmPlugin.inject = inject
 
 export default applySkillStateLlmPlugin

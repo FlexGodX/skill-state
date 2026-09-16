@@ -1,5 +1,8 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
+import { readFileSync } from 'node:fs'
+import { dirname, join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 import {
   buildGatewayRequest,
@@ -10,6 +13,8 @@ import {
   stableSessionId,
   usageFromProvider,
 } from '../src/protocol.mjs'
+
+const PACKAGE_ROOT = join(dirname(fileURLToPath(import.meta.url)), '..')
 
 test('normalizes a gateway-backed route without a credential', () => {
   assert.deepEqual(normalizeConfig({ gatewayBaseUrl: 'http://127.0.0.1:8787/v1' }), {
@@ -102,4 +107,25 @@ test('projects the latest message only', () => {
     { role: 'assistant', content: [{ type: 'text', text: 'new' }] },
   ])
   assert.equal(observation.content[0].text, 'new')
+})
+
+test('declares a DSH bundle patch that mounts the session-bound adapter', () => {
+  const manifest = JSON.parse(readFileSync(join(PACKAGE_ROOT, 'package.json'), 'utf8'))
+  assert.equal(manifest.dsh?.bundle?.patch, './cordis.patch.yml')
+  assert.deepEqual(manifest.files, [
+    'src',
+    'cordis.patch.yml',
+    'config.example.json',
+    'README.md',
+    'package.json',
+  ])
+
+  const patch = readFileSync(join(PACKAGE_ROOT, 'cordis.patch.yml'), 'utf8')
+  const plugin = readFileSync(join(PACKAGE_ROOT, 'src/index.mjs'), 'utf8')
+  assert.match(plugin, /export const inject = \['llm'\]/u)
+  assert.match(plugin, /applySkillStateLlmPlugin\.inject = inject/u)
+  assert.match(patch, /id: skill-state-llm/u)
+  assert.match(patch, /name: '@skill-state\/deepseek-harness-adapter'/u)
+  assert.match(patch, /gatewayBaseUrl: !!js process\.env\.SKILL_STATE_GATEWAY_URL/u)
+  assert.match(patch, /apiKeyEnv: SKILL_STATE_GATEWAY_API_KEY/u)
 })

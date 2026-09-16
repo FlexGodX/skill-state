@@ -3,6 +3,18 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "files": [
+    "src",
+    "cordis.patch.yml",
+    "config.example.json",
+    "README.md",
+    "package.json"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
   "exports": {
     ".": "./src/index.mjs",
     "./adapter": "./src/adapter.mjs",
