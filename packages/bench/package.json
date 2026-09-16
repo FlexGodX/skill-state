@@ -1,0 +1,20 @@
+{
+  "name": "skill-state-bench",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "skill-state-bench": "./bin/skill-state-bench.mjs"
+  },
+  "exports": {
+    ".": "./src/index.mjs",
+    "./runner": "./src/runner.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "typecheck": "node --check src/records.mjs && node --check src/aggregate.mjs && node --check src/report.mjs && node --check src/runner.mjs && node --check src/index.mjs && node --check bin/skill-state-bench.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

@@ -1,0 +1,557 @@
+const MAX_STRUCTURED_OUTPUT_BYTES = 2 * 1024 * 1024;
+const MAX_STRUCTURED_DEPTH = 40;
+
+export const CHAT_COMPLETIONS_PATH = "/v1/chat/completions";
+export const RESPONSES_PATH = "/v1/responses";
+export const SUPPORTED_PATHS = Object.freeze([
+  CHAT_COMPLETIONS_PATH,
+  RESPONSES_PATH,
+]);
+
+export class GatewayError extends Error {
+  constructor(status, code, message, details = undefined, options = {}) {
+    super(message, options);
+    this.name = "GatewayError";
+    this.status = status;
+    this.code = code;
+    this.details = details;
+    this.exposeDetails = options.exposeDetails === true;
+  }
+}
+
+export function isPlainRecord(value) {
+  if (value === null || typeof value !== "object") return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function hasForbiddenKey(key) {
+  return key === "__proto__" || key === "prototype" || key === "constructor";
+}
+
+function validateJsonValue(value, depth = 0, seen = new Set()) {
+  if (depth > MAX_STRUCTURED_DEPTH) {
+    throw new GatewayError(
+      502,
+      "invalid_structured_output",
+      "Structured output exceeds the maximum nesting depth.",
+    );
+  }
+
+  if (value === null || typeof value === "string" || typeof value === "boolean") {
+    return;
+  }
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new GatewayError(
+        502,
+        "invalid_structured_output",
+        "Structured output contains a non-finite number.",
+      );
+    }
+    return;
+  }
+  if (typeof value !== "object") {
+    throw new GatewayError(
+      502,
+      "invalid_structured_output",
+      "Structured output contains a non-JSON value.",
+    );
+  }
+  if (seen.has(value)) {
+    throw new GatewayError(
+      502,
+      "invalid_structured_output",
+      "Structured output contains a circular value.",
+    );
+  }
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    for (const item of value) validateJsonValue(item, depth + 1, seen);
+  } else {
+    if (!isPlainRecord(value)) {
+      throw new GatewayError(
+        502,
+        "invalid_structured_output",
+        "Structured output contains a non-plain object.",
+      );
+    }
+    for (const [key, item] of Object.entries(value)) {
+      if (hasForbiddenKey(key)) {
+        throw new GatewayError(
+          502,
+          "invalid_structured_output",
+          "Structured output contains a forbidden object key.",
+        );
+      }
+      validateJsonValue(item, depth + 1, seen);
+    }
+  }
+
+  seen.delete(value);
+}
+
+function checkStructuredOutputSize(value) {
+  let serialized;
+  try {
+    serialized = JSON.stringify(value);
+  } catch {
+    throw new GatewayError(
+      502,
+      "invalid_structured_output",
+      "Structured output is not serializable JSON.",
+    );
+  }
+  if (serialized === undefined || Buffer.byteLength(serialized, "utf8") > MAX_STRUCTURED_OUTPUT_BYTES) {
+    throw new GatewayError(
+      502,
+      "invalid_structured_output",
+      "Structured output is too large.",
+    );
+  }
+}
+
+/**
+ * Validate the provider's state/action protocol before exposing either part
+ * to callers. The state patch is deliberately a JSON merge patch object; a
+ * core implementation can apply stricter domain validation after receipt.
+ */
+export function validateStructuredEnvelope(value) {
+  if (!isPlainRecord(value)) {
+    throw new GatewayError(
+      502,
+      "invalid_structured_output",
+      "Model output must be a JSON object.",
+    );
+  }
+  if (!Object.prototype.hasOwnProperty.call(value, "state_patch")) {
+    throw new GatewayError(
+      502,
+      "invalid_structured_output",
+      "Model output is missing state_patch.",
+    );
+  }
+  if (!Object.prototype.hasOwnProperty.call(value, "action")) {
+    throw new GatewayError(
+      502,
+      "invalid_structured_output",
+      "Model output is missing action.",
+    );
+  }
+
+  const statePatch = value.state_patch;
+  if (!isPlainRecord(statePatch)) {
+    throw new GatewayError(
+      502,
+      "invalid_structured_output",
+      "state_patch must be a JSON object.",
+    );
+  }
+  const action = value.action;
+  if (action !== null) {
+    if (!isPlainRecord(action) || typeof action.type !== "string" || action.type.trim() === "") {
+      throw new GatewayError(
+        502,
+        "invalid_structured_output",
+        "action must be null or an object with a non-empty type.",
+      );
+    }
+    if (action.type.length > 128) {
+      throw new GatewayError(
+        502,
+        "invalid_structured_output",
+        "action.type is too long.",
+      );
+    }
+    if (Object.prototype.hasOwnProperty.call(action, "payload")) {
+      validateJsonValue(action.payload);
+    }
+  }
+
+  validateJsonValue(statePatch);
+  validateJsonValue(action);
+  checkStructuredOutputSize(value);
+
+  return {
+    state_patch: statePatch,
+    action,
+  };
+}
+
+function removeCodeFence(text) {
+  const trimmed = text.trim();
+  const fenced = trimmed.match(/^```(?:json|application\/json)?\s*([\s\S]*?)\s*```$/i);
+  return fenced ? fenced[1].trim() : trimmed;
+}
+
+function findJsonObject(text) {
+  const first = text.indexOf("{");
+  const last = text.lastIndexOf("}");
+  if (first < 0 || last <= first) return null;
+  return text.slice(first, last + 1);
+}
+
+export function parseStructuredOutput(text) {
+  if (typeof text !== "string" || text.trim() === "") {
+    throw new GatewayError(
+      502,
+      "invalid_structured_output",
+      "Model output did not contain structured JSON.",
+    );
+  }
+  if (Buffer.byteLength(text, "utf8") > MAX_STRUCTURED_OUTPUT_BYTES) {
+    throw new GatewayError(
+      502,
+      "invalid_structured_output",
+      "Model output is too large.",
+    );
+  }
+
+  const candidates = [];
+  const cleaned = removeCodeFence(text);
+  candidates.push(cleaned);
+  const extracted = findJsonObject(cleaned);
+  if (extracted && extracted !== cleaned) candidates.push(extracted);
+
+  let parsed;
+  for (const candidate of candidates) {
+    try {
+      parsed = JSON.parse(candidate);
+      break;
+    } catch {
+      // Try the next bounded candidate. No provider text is logged.
+    }
+  }
+  if (parsed === undefined) {
+    throw new GatewayError(
+      502,
+      "invalid_structured_output",
+      "Model output was not valid JSON.",
+    );
+  }
+  return validateStructuredEnvelope(parsed);
+}
+
+function textFromContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) => {
+      if (typeof part === "string") return part;
+      if (!part || typeof part !== "object") return "";
+      if (typeof part.text === "string") return part.text;
+      if (typeof part.output_text === "string") return part.output_text;
+      if (typeof part.content === "string") return part.content;
+      return "";
+    })
+    .join("");
+}
+
+function textFromChatPayload(payload) {
+  if (!payload || typeof payload !== "object") return "";
+  if (Array.isArray(payload.choices)) {
+    return payload.choices
+      .map((choice) => textFromContent(choice?.message?.content ?? choice?.delta?.content ?? choice?.text))
+      .join("");
+  }
+  return "";
+}
+
+function textFromResponsesPayload(payload) {
+  if (!payload || typeof payload !== "object") return "";
+  if (typeof payload.output_text === "string") return payload.output_text;
+  if (Array.isArray(payload.output)) {
+    return payload.output
+      .map((item) => textFromContent(item?.content ?? item?.text ?? item?.output_text))
+      .join("");
+  }
+  return "";
+}
+
+export function extractTextFromPayload(endpoint, payload) {
+  if (payload && typeof payload === "object" &&
+      Object.prototype.hasOwnProperty.call(payload, "state_patch") &&
+      Object.prototype.hasOwnProperty.call(payload, "action")) {
+    return JSON.stringify(validateStructuredEnvelope(payload));
+  }
+  return endpoint === RESPONSES_PATH
+    ? textFromResponsesPayload(payload)
+    : textFromChatPayload(payload);
+}
+
+function parseSseRecords(body) {
+  const records = [];
+  let event = "message";
+  let dataLines = [];
+
+  const flush = () => {
+    if (dataLines.length === 0) {
+      event = "message";
+      return;
+    }
+    records.push({ event, data: dataLines.join("\n") });
+    event = "message";
+    dataLines = [];
+  };
+
+  for (const line of body.split(/\r?\n/)) {
+    if (line === "") {
+      flush();
+      continue;
+    }
+    if (line.startsWith(":")) continue;
+    const separator = line.indexOf(":");
+    const field = separator === -1 ? line : line.slice(0, separator);
+    let value = separator === -1 ? "" : line.slice(separator + 1);
+    if (value.startsWith(" ")) value = value.slice(1);
+    if (field === "event") event = value;
+    if (field === "data") dataLines.push(value);
+  }
+  flush();
+  return records;
+}
+
+function looksLikeSse(body, contentType = "") {
+  return contentType.toLowerCase().includes("text/event-stream") ||
+    /^\s*(?:event:|data:)/m.test(body);
+}
+
+function usageFromPayload(value) {
+  if (!value || typeof value !== "object") return undefined;
+  const usage = {};
+  for (const field of [
+    "prompt_tokens",
+    "completion_tokens",
+    "total_tokens",
+    "input_tokens",
+    "output_tokens",
+  ]) {
+    if (Number.isFinite(value[field])) usage[field] = value[field];
+  }
+  const cached = value.prompt_tokens_details?.cached_tokens ?? value.input_tokens_details?.cached_tokens;
+  const reasoning = value.completion_tokens_details?.reasoning_tokens ?? value.output_tokens_details?.reasoning_tokens;
+  if (Number.isFinite(cached)) usage.prompt_tokens_details = { cached_tokens: cached };
+  if (Number.isFinite(reasoning)) usage.completion_tokens_details = { reasoning_tokens: reasoning };
+  return Object.keys(usage).length > 0 ? usage : undefined;
+}
+
+export function extractTextFromStream(endpoint, body, contentType = "") {
+  if (!looksLikeSse(body, contentType)) {
+    let payload;
+    try {
+      payload = JSON.parse(body);
+    } catch {
+      throw new GatewayError(
+        502,
+        "invalid_upstream_response",
+        "Upstream returned neither JSON nor SSE.",
+      );
+    }
+    return {
+      text: extractTextFromPayload(endpoint, payload),
+      upstreamPayload: payload,
+      records: [],
+      metadata: { id: payload?.id, model: payload?.model, created: payload?.created },
+    };
+  }
+
+  const records = parseSseRecords(body);
+  const chunks = [];
+  let completedText = "";
+  let metadata = {};
+  for (const record of records) {
+    if (record.data === "[DONE]") continue;
+    let data;
+    try {
+      data = JSON.parse(record.data);
+    } catch {
+      continue;
+    }
+    metadata = {
+      id: metadata.id ?? data?.id ?? data?.response?.id,
+      model: metadata.model ?? data?.model ?? data?.response?.model,
+      created: metadata.created ?? data?.created ?? data?.response?.created_at,
+      usage: metadata.usage ?? usageFromPayload(data?.usage ?? data?.response?.usage),
+    };
+    if (endpoint === CHAT_COMPLETIONS_PATH) {
+      const chunk = data?.choices?.[0]?.delta?.content ?? data?.choices?.[0]?.text;
+      if (typeof chunk === "string") chunks.push(chunk);
+      const messageText = data?.choices?.[0]?.message?.content;
+      if (typeof messageText === "string" && chunks.length === 0) chunks.push(messageText);
+    } else {
+      if (typeof data?.delta === "string" &&
+          (record.event.includes("output_text") || data?.type?.includes("output_text"))) {
+        chunks.push(data.delta);
+      }
+      if (typeof data?.output_text === "string") completedText = data.output_text;
+      if (typeof data?.response?.output_text === "string") completedText = data.response.output_text;
+      const outputText = textFromResponsesPayload(data);
+      if (outputText && chunks.length === 0) completedText = outputText;
+    }
+  }
+
+  return {
+    text: chunks.length > 0 ? chunks.join("") : completedText,
+    upstreamPayload: null,
+    records,
+    metadata,
+  };
+}
+
+export function createChatResponse({ envelope, upstreamPayload, metadata = {}, model, requestId }) {
+  const id = upstreamPayload?.id ?? metadata.id ?? `chatcmpl-${requestId}`;
+  const created = upstreamPayload?.created ?? metadata.created ?? Math.floor(Date.now() / 1000);
+  const response = {
+    id,
+    object: "chat.completion",
+    created,
+    model: upstreamPayload?.model ?? metadata.model ?? model,
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: "assistant",
+          content: JSON.stringify(envelope),
+        },
+        finish_reason: "stop",
+      },
+    ],
+    state_patch: envelope.state_patch,
+    action: envelope.action,
+  };
+  const usage = upstreamPayload?.usage ?? metadata.usage;
+  if (usage) response.usage = usage;
+  return response;
+}
+
+export function createResponsesResponse({ envelope, upstreamPayload, metadata = {}, model, requestId }) {
+  const id = upstreamPayload?.id ?? metadata.id ?? `resp-${requestId}`;
+  const createdAt = upstreamPayload?.created_at ?? metadata.created ?? Math.floor(Date.now() / 1000);
+  const text = JSON.stringify(envelope);
+  const response = {
+    id,
+    object: "response",
+    created_at: createdAt,
+    model: upstreamPayload?.model ?? metadata.model ?? model,
+    status: "completed",
+    output: [
+      {
+        id: `${id}-message`,
+        type: "message",
+        role: "assistant",
+        content: [{ type: "output_text", text }],
+      },
+    ],
+    output_text: text,
+    state_patch: envelope.state_patch,
+    action: envelope.action,
+  };
+  const usage = upstreamPayload?.usage ?? metadata.usage;
+  if (usage) response.usage = usage;
+  return response;
+}
+
+function chunkText(text, chunkSize = 256) {
+  const codePoints = Array.from(text);
+  const chunks = [];
+  for (let index = 0; index < codePoints.length; index += chunkSize) {
+    chunks.push(codePoints.slice(index, index + chunkSize).join(""));
+  }
+  return chunks.length > 0 ? chunks : [""];
+}
+
+function sseEvent(value, eventType = undefined) {
+  return `${eventType ? `event: ${eventType}\n` : ""}data: ${JSON.stringify(value)}\n\n`;
+}
+
+export function createChatStream({ envelope, upstreamPayload, metadata = {}, model, requestId }) {
+  const response = createChatResponse({ envelope, upstreamPayload, metadata, model, requestId });
+  const chunks = chunkText(response.choices[0].message.content);
+  let output = "";
+  chunks.forEach((content, index) => {
+    output += sseEvent({
+      id: response.id,
+      object: "chat.completion.chunk",
+      created: response.created,
+      model: response.model,
+      choices: [{
+        index: 0,
+        delta: index === 0 ? { role: "assistant", content } : { content },
+        finish_reason: null,
+      }],
+    });
+  });
+  output += sseEvent({
+    id: response.id,
+    object: "chat.completion.chunk",
+    created: response.created,
+    model: response.model,
+    choices: [{ index: 0, delta: {}, finish_reason: "stop" }],
+  });
+  output += "data: [DONE]\n\n";
+  return output;
+}
+
+export function createResponsesStream({ envelope, upstreamPayload, metadata = {}, model, requestId }) {
+  const response = createResponsesResponse({ envelope, upstreamPayload, metadata, model, requestId });
+  const message = response.output[0];
+  const text = response.output_text;
+  let output = "";
+  output += sseEvent({
+    type: "response.created",
+    response: { ...response, status: "in_progress", output: [] },
+  }, "response.created");
+  output += sseEvent({
+    type: "response.output_item.added",
+    response_id: response.id,
+    output_index: 0,
+    item: { id: message.id, type: "message", role: "assistant", content: [] },
+  }, "response.output_item.added");
+  for (const delta of chunkText(text)) {
+    output += sseEvent({
+      type: "response.output_text.delta",
+      response_id: response.id,
+      item_id: message.id,
+      output_index: 0,
+      content_index: 0,
+      delta,
+    }, "response.output_text.delta");
+  }
+  output += sseEvent({
+    type: "response.output_text.done",
+    response_id: response.id,
+    item_id: message.id,
+    output_index: 0,
+    content_index: 0,
+    text,
+  }, "response.output_text.done");
+  output += sseEvent({
+    type: "response.output_item.done",
+    response_id: response.id,
+    output_index: 0,
+    item: message,
+  }, "response.output_item.done");
+  output += sseEvent({ type: "response.completed", response }, "response.completed");
+  output += "data: [DONE]\n\n";
+  return output;
+}
+
+export function errorResponseBody(error, requestId) {
+  const isGatewayError = error instanceof GatewayError;
+  const status = isGatewayError ? error.status : 500;
+  const code = isGatewayError ? error.code : "gateway_internal_error";
+  const message = isGatewayError ? error.message : "Gateway failed to process the request.";
+  const body = {
+    error: {
+      message,
+      type: "gateway_error",
+      code,
+      request_id: requestId,
+    },
+  };
+  if (isGatewayError && error.exposeDetails && error.details !== undefined) {
+    body.error.details = error.details;
+  }
+  return { status, body };
+}

@@ -1,0 +1,34 @@
+{
+  "name": "skill-state",
+  "version": "0.1.0",
+  "description": "Connect agent sessions to the skill-state provider gateway with observable, state-aware model calls.",
+  "author": {
+    "name": "skill-state"
+  },
+  "license": "MIT",
+  "keywords": [
+    "state",
+    "agent",
+    "provider",
+    "gateway",
+    "observability"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Skill State",
+    "shortDescription": "State-aware provider routing and observations",
+    "longDescription": "Route supported model clients through the skill-state gateway and record session and tool observations without placing credentials in the plugin.",
+    "developerName": "skill-state",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read"
+    ],
+    "defaultPrompt": [
+      "Explain how to connect a client to skill-state",
+      "Show the provider and observation flow",
+      "Check the integration prerequisites"
+    ],
+    "brandColor": "#2563EB"
+  }
+}

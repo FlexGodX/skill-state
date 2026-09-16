@@ -1,0 +1,79 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  node:
+    name: Node 20 build, typecheck, and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Build core
+        run: npm run build:core
+
+      - name: Typecheck source
+        run: npm run typecheck
+
+      - name: Run core, gateway, integration, and plugin tests
+        run: npm test
+
+      - name: Run optional benchmark package tests and syntax checks
+        run: |
+          npm --workspace skill-state-bench test
+          npm --workspace skill-state-bench run typecheck
+
+      - name: Validate documentation links
+        run: node .github/scripts/check-doc-links.mjs
+
+  plugin-validation:
+    name: Plugin and skill validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Create isolated validator environment
+        run: |
+          python -m venv "$RUNNER_TEMP/skill-state-validator-venv"
+          "$RUNNER_TEMP/skill-state-validator-venv/bin/python" -m pip install \
+            --disable-pip-version-check --no-input PyYAML
+
+      - name: Validate plugin manifest, hooks, and skill
+        run: |
+          "$RUNNER_TEMP/skill-state-validator-venv/bin/python" \
+            .github/scripts/validate_plugin.py
+
+  secret-scan:
+    name: Local secret-pattern scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Scan repository files without uploading contents
+        run: bash .github/scripts/secret-scan.sh

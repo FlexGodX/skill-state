@@ -1,0 +1,15 @@
+# Example fragment; see integrations/codex/custom-provider.toml for details.
+# Before starting the gateway, set one trusted procedure source, for example:
+#   export SKILL_STATE_PROCEDURE_FILE="$PWD/examples/skill-state-procedure.json"
+# Procedure configuration is immutable startup state and must not be supplied
+# by a client request. SKILL_STATE_PROCEDURE or createGateway({ procedure })
+# are the other supported startup forms.
+[model_providers.skill_state]
+name = "skill-state gateway"
+base_url = "http://127.0.0.1:8787/v1"
+wire_api = "responses"
+env_key = "SKILL_STATE_GATEWAY_API_KEY"
+
+[profiles.skill_state]
+model = "state-model"
+model_provider = "skill_state"

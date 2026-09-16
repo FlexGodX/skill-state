@@ -1,0 +1,13 @@
+# Codex custom-provider fragment for the local skill-state gateway.
+# Keep this file as a template. Supply any gateway credential through the
+# environment variable named by env_key; no secret belongs in this fragment.
+
+[model_providers.skill_state]
+name = "skill-state gateway"
+base_url = "http://127.0.0.1:8787/v1"
+wire_api = "responses"
+env_key = "SKILL_STATE_GATEWAY_API_KEY"
+
+[profiles.skill_state]
+model = "state-model"
+model_provider = "skill_state"

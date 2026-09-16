@@ -1,0 +1,6 @@
+{
+  "provider": "skill-state",
+  "model": "state-model",
+  "gatewayBaseUrl": "http://127.0.0.1:8787/v1",
+  "apiKeyEnv": "SKILL_STATE_GATEWAY_API_KEY"
+}

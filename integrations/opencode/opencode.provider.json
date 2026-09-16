@@ -1,0 +1,39 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "skill-state": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "skill-state gateway",
+      "env": [
+        "SKILL_STATE_GATEWAY_API_KEY"
+      ],
+      "options": {
+        "baseURL": "http://127.0.0.1:8787/v1"
+      },
+      "models": {
+        "state-model": {
+          "name": "skill-state model",
+          "reasoning": false,
+          "tool_call": false,
+          "attachment": false,
+          "limit": {
+            "context": 8192,
+            "output": 2048
+          },
+          "modalities": {
+            "input": [
+              "text"
+            ],
+            "output": [
+              "text"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "model": "skill-state/state-model",
+  "plugin": [
+    "./integrations/opencode/skill-state.plugin.mjs"
+  ]
+}

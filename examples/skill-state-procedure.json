@@ -1,0 +1,5 @@
+{
+  "id": "skill-state-default",
+  "version": 1,
+  "instructions": "Use the supplied P+Sigma+O envelope and return a validated state patch plus action."
+}
