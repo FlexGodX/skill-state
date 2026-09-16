@@ -20,7 +20,10 @@ Copy or link `src/` into a harness composition that already provides `@deepseek-
 `apiKeyEnv` is resolved by the adapter only when the named variable is present.
 
 The adapter translates OpenAI JSON/SSE deltas into `StreamChunk` values, buffers terminal usage until
-all blocks close, and emits one final `finish`. It does not carry a provider key in source files.
+all blocks close, and emits one final `finish`. Non-2xx gateway responses remain
+`PROVIDER_HTTP` failures but include only `status`, gateway `code`, and gateway
+`category` in the diagnostic; response bodies and prompt text are discarded. It
+does not carry a provider key in source files.
 
 ## DSH profile bundle
 

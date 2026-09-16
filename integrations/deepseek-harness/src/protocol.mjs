@@ -181,6 +181,51 @@ export function parseProviderPayload(data) {
   }
 }
 
+const SAFE_GATEWAY_ERROR_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/u
+const MAX_GATEWAY_ERROR_BODY_BYTES = 16 * 1024
+
+function safeGatewayErrorToken(value) {
+  if (typeof value !== 'string') return undefined
+  const token = value.trim()
+  return SAFE_GATEWAY_ERROR_TOKEN.test(token) ? token : undefined
+}
+
+/**
+ * Read only bounded machine metadata from a gateway error envelope.
+ * Error messages and all other body fields are deliberately discarded.
+ */
+export async function readGatewayErrorMetadata(response) {
+  if (!response || typeof response.clone !== 'function') return {}
+  const contentLength = Number(response.headers.get('content-length'))
+  if (Number.isFinite(contentLength) && contentLength > MAX_GATEWAY_ERROR_BODY_BYTES) return {}
+
+  let payload
+  try {
+    const body = await response.clone().text()
+    if (new TextEncoder().encode(body).byteLength > MAX_GATEWAY_ERROR_BODY_BYTES) return {}
+    payload = JSON.parse(body)
+  } catch {
+    return {}
+  }
+
+  const error = payload && typeof payload === 'object' && payload.error
+  if (!error || typeof error !== 'object' || Array.isArray(error)) return {}
+  const code = safeGatewayErrorToken(error.code)
+  const category = safeGatewayErrorToken(error.type)
+  return {
+    ...(code === undefined ? {} : { code }),
+    ...(category === undefined ? {} : { category }),
+  }
+}
+
+/** Format only gateway status/category/code; never include provider body text. */
+export function gatewayErrorDiagnostic(status, metadata = {}) {
+  const statusValue = Number.isInteger(status) ? String(status) : 'unknown'
+  const code = safeGatewayErrorToken(metadata.code) ?? 'unknown'
+  const category = safeGatewayErrorToken(metadata.category) ?? 'unknown'
+  return `status=${statusValue}, code=${code}, category=${category}`
+}
+
 export function mapFinishReason(value) {
   if (value === 'tool_calls') return { kind: 'tool-calls' }
   if (value === 'length') return { kind: 'max-tokens' }

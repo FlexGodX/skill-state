@@ -3,16 +3,19 @@ import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm'
 import {
   buildGatewayRequest,
   extractChoice,
+  gatewayErrorDiagnostic,
   mapFinishReason,
   normalizeConfig,
   parseProviderPayload,
+  readGatewayErrorMetadata,
   readSseData,
   usageFromProvider,
 } from './protocol.mjs'
 
-function responseError(message, response) {
+async function responseError(message, response) {
   const requestId = response.headers.get('x-request-id') ?? response.headers.get('x-gateway-request-id')
-  return new LlmError(message, 'PROVIDER_HTTP', {
+  const metadata = await readGatewayErrorMetadata(response)
+  return new LlmError(`${message} (${gatewayErrorDiagnostic(response.status, metadata)})`, 'PROVIDER_HTTP', {
     status: response.status,
     ...(requestId ? { requestId } : {}),
   })
@@ -67,7 +70,7 @@ export class SkillStateLlmAdapter extends LlmAdapter {
       body: JSON.stringify(request.body),
       signal: options.signal,
     })
-    if (!response.ok) throw responseError('skill-state gateway rejected the model request', response)
+    if (!response.ok) throw await responseError('skill-state gateway rejected the model request', response)
 
     const contentType = response.headers.get('content-type') ?? ''
     if (!contentType.includes('text/event-stream')) {

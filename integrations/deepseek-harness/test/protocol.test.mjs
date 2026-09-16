@@ -6,11 +6,13 @@ import { fileURLToPath } from 'node:url'
 
 import {
   buildGatewayRequest,
+  gatewayErrorDiagnostic,
   latestObservationFromMessages,
   latestToolResultFromMessages,
   mapFinishReason,
   normalizeConfig,
   stableSessionId,
+  readGatewayErrorMetadata,
   usageFromProvider,
 } from '../src/protocol.mjs'
 
@@ -99,6 +101,40 @@ test('maps usage and terminal finish reasons', () => {
   })
   assert.deepEqual(mapFinishReason('length'), { kind: 'max-tokens' })
   assert.deepEqual(mapFinishReason('tool_calls'), { kind: 'tool-calls' })
+})
+
+test('extracts only safe gateway error metadata and never body messages', async () => {
+  const response = new Response(JSON.stringify({
+    error: {
+      message: 'prompt text must never appear in adapter diagnostics',
+      type: 'gateway_error',
+      code: 'invalid_structured_output',
+      request_id: 'request-1',
+    },
+  }), {
+    status: 502,
+    headers: { 'content-type': 'application/json' },
+  })
+
+  assert.deepEqual(await readGatewayErrorMetadata(response), {
+    code: 'invalid_structured_output',
+    category: 'gateway_error',
+  })
+  assert.equal(gatewayErrorDiagnostic(502, await readGatewayErrorMetadata(response)),
+    'status=502, code=invalid_structured_output, category=gateway_error')
+  assert.doesNotMatch(gatewayErrorDiagnostic(502, await readGatewayErrorMetadata(response)), /prompt text/u)
+})
+
+test('drops malformed or oversized gateway metadata', async () => {
+  const malformed = new Response(JSON.stringify({
+    error: { message: 'hidden', type: 'gateway error', code: 'bad code' },
+  }), { status: 400 })
+  assert.deepEqual(await readGatewayErrorMetadata(malformed), {})
+
+  const oversized = new Response(JSON.stringify({
+    error: { message: 'hidden', type: 'gateway_error', code: 'valid', padding: 'x'.repeat(16 * 1024) },
+  }), { status: 500 })
+  assert.deepEqual(await readGatewayErrorMetadata(oversized), {})
 })
 
 test('projects the latest message only', () => {
