@@ -6,6 +6,8 @@ import { fileURLToPath } from 'node:url'
 
 import {
   buildGatewayRequest,
+  createRequestSignal,
+  DEFAULT_REQUEST_TIMEOUT_MS,
   gatewayErrorDiagnostic,
   latestObservationFromMessages,
   latestToolResultFromMessages,
@@ -23,7 +25,20 @@ test('normalizes a gateway-backed route without a credential', () => {
     gatewayBaseUrl: 'http://127.0.0.1:8787/v1',
     provider: 'skill-state',
     model: 'state-model',
+    timeoutMs: DEFAULT_REQUEST_TIMEOUT_MS,
   })
+})
+
+test('validates and enforces the bounded adapter request timeout', async () => {
+  assert.equal(DEFAULT_REQUEST_TIMEOUT_MS, 180_000)
+  assert.equal(normalizeConfig({ gatewayBaseUrl: 'http://127.0.0.1:8787/v1', timeoutMs: 180_000 }).timeoutMs, 180_000)
+  assert.throws(() => normalizeConfig({ gatewayBaseUrl: 'http://127.0.0.1:8787/v1', timeoutMs: 0 }), /timeoutMs/u)
+
+  const control = createRequestSignal(undefined, 5)
+  await new Promise(resolve => setTimeout(resolve, 15))
+  assert.equal(control.signal.aborted, true)
+  assert.equal(control.timedOut(), true)
+  control.dispose()
 })
 
 test('rejects gateway URLs containing credentials', () => {

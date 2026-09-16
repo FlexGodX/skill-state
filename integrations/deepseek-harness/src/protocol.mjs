@@ -1,5 +1,7 @@
 const DEFAULT_PROVIDER = 'skill-state'
 const DEFAULT_MODEL = 'state-model'
+export const DEFAULT_REQUEST_TIMEOUT_MS = 180_000
+const MAX_REQUEST_TIMEOUT_MS = 2_147_483_647
 
 function nonEmptyString(value, field) {
   if (typeof value !== 'string' || value.trim() === '') throw new TypeError(`${field} must be a non-empty string`)
@@ -89,6 +91,10 @@ export function normalizeConfig(config = {}) {
   gatewayEndpoint(gatewayBaseUrl)
   const provider = config.provider === undefined ? DEFAULT_PROVIDER : nonEmptyString(config.provider, 'provider')
   const model = config.model === undefined ? DEFAULT_MODEL : nonEmptyString(config.model, 'model')
+  const timeoutMs = config.timeoutMs === undefined ? DEFAULT_REQUEST_TIMEOUT_MS : config.timeoutMs
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_REQUEST_TIMEOUT_MS) {
+    throw new TypeError(`timeoutMs must be a positive safe integer no greater than ${MAX_REQUEST_TIMEOUT_MS}`)
+  }
   const apiKeyEnv = config.apiKeyEnv === undefined ? undefined : nonEmptyString(config.apiKeyEnv, 'apiKeyEnv')
   const suppliedApiKey = config.apiKey === undefined
     ? apiKeyEnv === undefined ? undefined : process.env[apiKeyEnv]
@@ -98,8 +104,26 @@ export function normalizeConfig(config = {}) {
     gatewayBaseUrl,
     provider,
     model,
+    timeoutMs,
     ...(apiKey === undefined ? {} : { apiKey }),
   })
+}
+
+/** Compose the caller signal with the adapter's bounded request deadline. */
+export function createRequestSignal(parentSignal, timeoutMs) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_REQUEST_TIMEOUT_MS) {
+    throw new TypeError(`timeoutMs must be a positive safe integer no greater than ${MAX_REQUEST_TIMEOUT_MS}`)
+  }
+  const timeoutController = new AbortController()
+  const timer = setTimeout(() => timeoutController.abort(), timeoutMs)
+  const signal = parentSignal === undefined
+    ? timeoutController.signal
+    : AbortSignal.any([parentSignal, timeoutController.signal])
+  return {
+    signal,
+    timedOut: () => timeoutController.signal.aborted && !parentSignal?.aborted,
+    dispose: () => clearTimeout(timer),
+  }
 }
 
 function addControl(controls, key, value) {
