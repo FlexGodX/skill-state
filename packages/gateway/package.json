@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "bin": {
+    "skill-state-gateway": "./bin/skill-state-gateway.mjs"
+  },
   "dependencies": {
     "@skill-state/core": "0.1.0"
   },
@@ -14,8 +17,9 @@
     "./core-boundary": "./src/core-boundary.mjs"
   },
   "scripts": {
+    "start": "node ./bin/skill-state-gateway.mjs",
     "test": "node --test test/*.test.mjs",
-    "typecheck": "node --check src/core-boundary.mjs && node --check src/protocol.mjs && node --check src/upstream.mjs && node --check src/server.mjs && node --check src/index.mjs"
+    "typecheck": "node --check bin/skill-state-gateway.mjs && node --check src/core-boundary.mjs && node --check src/protocol.mjs && node --check src/upstream.mjs && node --check src/server.mjs && node --check src/index.mjs"
   },
   "engines": {
     "node": ">=20"

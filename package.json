@@ -13,6 +13,7 @@
   "scripts": {
     "build:core": "tsc --project packages/core/tsconfig.build.json",
     "build": "npm run build:core",
+    "start:gateway": "npm --workspace @skill-state/gateway run start",
     "pretest": "npm run build:core",
     "test": "npm run test:core && npm run test:gateway && npm run test:integrations && npm run test:bench",
     "test:core": "tsx --test packages/core/test/*.test.ts",

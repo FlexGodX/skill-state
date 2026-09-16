@@ -94,6 +94,34 @@ only when metadata-only operational logging is desired.
 routes, the structured protocol, and the fact that streaming is buffered for
 validation.
 
+## Local runtime
+
+Run the loopback-only production entrypoint with:
+
+```sh
+npm run start:gateway
+```
+
+The entrypoint requires a trusted procedure file and creates the private state
+directory before listening. Its defaults are suitable for a local LM Studio
+server:
+
+```text
+SKILL_STATE_BIND_HOST=127.0.0.1
+SKILL_STATE_PORT=8787
+SKILL_STATE_ROOT=~/.local/share/skill-state
+SKILL_STATE_PROCEDURE_FILE=~/.config/skill-state/procedure.json
+PROVIDER_UPSTREAM_URL=http://127.0.0.1:1234/v1
+```
+
+Use `SKILL_STATE_PROCEDURE_FILE` to select either a trusted JSON or Markdown
+procedure. `PROVIDER_UPSTREAM_API_KEY` is optional for local LM Studio and is
+never included in startup output. `npm --workspace @skill-state/gateway run
+start -- --check` validates the bind, state directory, procedure file, and
+upstream configuration without starting a listener. The CLI emits only a
+metadata startup summary and never logs request, transcript, procedure, or
+model payloads.
+
 ## Core integration work
 
 The core package must expose `prepareCall` (or `buildContext`) and return the
