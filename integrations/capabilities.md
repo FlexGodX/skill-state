@@ -26,3 +26,7 @@ Unresolved developer experience items remain outside this patch:
 - OpenCode plugin hook availability is versioned. The plugin targets the installed 1.x hook names;
   deployments on another major version should validate the provider and tool hook signatures before
   enabling it.
+- `dx` is unverified on the current host: no command, alias, function, package, or documented runtime
+  seam with that name was found. The authoritative local DeepSeek Harness CLI is `dsh` (Harness
+  `0.1.2-alpha.2`), so this repository makes no `dx` compatibility claim. To identify `dx`, provide
+  the exact command/package or repository and the expected provider hook and stable session-ID field.
