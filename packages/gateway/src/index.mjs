@@ -3,6 +3,9 @@ export {
   buildUpstreamBody,
   createCoreBoundary,
   extractLatestObservation,
+  extractSessionId,
+  MAX_SESSION_ID_LENGTH,
+  SESSION_HEADER,
   pickRequestControls,
   sanitizeBoundaryValue,
 } from "./core-boundary.mjs";

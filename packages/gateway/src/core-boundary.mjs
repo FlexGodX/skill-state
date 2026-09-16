@@ -6,6 +6,12 @@ import {
   isPlainRecord,
 } from "./protocol.mjs";
 
+export const SESSION_HEADER = "x-skill-state-session";
+export const MAX_SESSION_ID_LENGTH = 128;
+const APPROVED_METADATA_SESSION_KEY = "skill_state_session_id";
+const PROVIDER_SESSION_HEADERS = Object.freeze(["session-id", "thread-id"]);
+const PROVIDER_METADATA_SESSION_KEYS = Object.freeze(["session_id", "thread_id"]);
+
 const CONTROL_FIELDS = Object.freeze([
   "temperature",
   "top_p",
@@ -44,7 +50,6 @@ const CONTROL_FIELDS = Object.freeze([
   "verbosity",
   "background",
   "safety_identifier",
-  "prompt_cache_key",
 ]);
 
 // The provider receives only model routing and documented generation controls
@@ -64,6 +69,7 @@ const TRANSCRIPT_KEYS = new Set([
   "history",
   "chat_history",
   "transcript",
+  "client_metadata",
   "latest_observation",
   "latestObservation",
   "action_result",
@@ -73,6 +79,16 @@ const TRANSCRIPT_KEYS = new Set([
   "session_id",
   "state_session_id",
   "sessionId",
+  "skill_state_session_id",
+  "x-skill-state-session",
+  "session-id",
+  "thread-id",
+  "thread_id",
+  "turn_id",
+  "turnId",
+  "response_id",
+  "responseId",
+  "prompt_cache_key",
   "state_revision",
   "expected_revision",
   "idempotency_key",
@@ -123,10 +139,25 @@ function contentValue(value) {
   return value;
 }
 
-function lastUserMessage(messages) {
+function toolObservation(value) {
+  return { kind: "tool_result", value: sanitizeBoundaryValue(value) };
+}
+
+function isToolMessage(message) {
+  return isPlainRecord(message) && (
+    message.role === "tool"
+    || message.role === "function"
+    || message.type === "tool_result"
+    || message.type === "tool_output"
+    || message.type === "function_call_output"
+  );
+}
+
+function lastMessageObservation(messages) {
   if (!Array.isArray(messages)) return undefined;
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
+    if (isToolMessage(message)) return toolObservation(message);
     if (isPlainRecord(message) && message.role === "user") {
       return contentValue(message.content);
     }
@@ -139,12 +170,8 @@ function lastInputItem(input) {
   if (!Array.isArray(input)) return undefined;
   for (let index = input.length - 1; index >= 0; index -= 1) {
     const item = input[index];
-    if (isPlainRecord(item) && item.role === "user") {
-      return contentValue(item.content ?? item.input ?? item.text);
-    }
-    if (isPlainRecord(item) && (item.role === "tool" || item.type === "function_call_output" || item.type === "tool_result")) {
-      return { kind: "tool_result", value: sanitizeBoundaryValue(item) };
-    }
+    if (isToolMessage(item)) return toolObservation(item);
+    if (isPlainRecord(item) && item.role === "user") return contentValue(item.content ?? item.input ?? item.text);
   }
   return undefined;
 }
@@ -160,14 +187,13 @@ export function extractLatestObservation(body, endpoint) {
   if (Object.prototype.hasOwnProperty.call(body, "tool_result")) {
     return { kind: "tool_result", value: body.tool_result };
   }
+  const value = endpoint === CHAT_COMPLETIONS_PATH
+    ? lastMessageObservation(body.messages)
+    : lastInputItem(body.input);
+  if (isPlainRecord(value) && value.kind === "tool_result") return value;
   if (Object.prototype.hasOwnProperty.call(body, "latest_observation")) {
     return body.latest_observation;
   }
-
-  const value = endpoint === CHAT_COMPLETIONS_PATH
-    ? lastUserMessage(body.messages)
-    : lastInputItem(body.input);
-  if (isPlainRecord(value) && value.kind === "tool_result") return value;
   return value === undefined ? null : { kind: "client_input", value };
 }
 
@@ -266,7 +292,10 @@ function assertEndpoint(endpoint) {
   }
 }
 
-export function createCoreBoundary(core, { trustedProcedureHash } = {}) {
+export function createCoreBoundary(core, {
+  trustedProcedureHash,
+  allowTestSessionFallback = false,
+} = {}) {
   if (!core || typeof core !== "object") {
     return {
       ready: false,
@@ -322,13 +351,19 @@ export function createCoreBoundary(core, { trustedProcedureHash } = {}) {
   return {
     ready: true,
     assertReady() {},
-    async prepare({ endpoint, body, requestId }) {
+    async prepare({ endpoint, body, headers, requestId }) {
       assertEndpoint(endpoint);
       const input = {
         protocol: "p+sigma+latest-o/v1",
         endpoint,
         model: body.model,
-        sessionId: resolveSessionId(body, requestId),
+        sessionId: extractSessionId({
+          body,
+          headers,
+          endpoint,
+          requestId,
+          allowTestSessionFallback,
+        }),
         expectedRevision: resolveExpectedRevision(body),
         idempotencyKey: resolveIdempotencyKey(body, requestId),
         latestObservation: extractLatestObservation(body, endpoint),
@@ -396,13 +431,81 @@ export function createCoreBoundary(core, { trustedProcedureHash } = {}) {
   };
 }
 
-function resolveSessionId(body, requestId) {
-  const candidate = body.session_id ?? body.state_session_id ?? body.sessionId;
-  if (candidate === undefined) return `request-${requestId}`;
-  if (typeof candidate !== "string" || candidate.trim() === "") {
-    throw new GatewayError(400, "invalid_session_id", "session_id must be a non-empty string.");
+function readHeader(headers, name) {
+  if (headers && typeof headers.get === "function") return headers.get(name) ?? undefined;
+  if (!isPlainRecord(headers)) return undefined;
+  for (const [key, value] of Object.entries(headers)) {
+    if (key.toLowerCase() === name && value !== undefined) return value;
   }
-  return candidate;
+  return undefined;
+}
+
+function validateSessionId(candidate, source) {
+  if (typeof candidate !== "string") {
+    throw new GatewayError(400, "invalid_session_id", `${source} must be a string.`);
+  }
+  const sessionId = candidate.trim();
+  if (
+    sessionId.length === 0
+    || sessionId.length > MAX_SESSION_ID_LENGTH
+    || /[\u0000-\u001f\u007f]/u.test(sessionId)
+  ) {
+    throw new GatewayError(
+      400,
+      "invalid_session_id",
+      `${source} must be a bounded non-empty string (maximum ${MAX_SESSION_ID_LENGTH} characters).`,
+    );
+  }
+  return sessionId;
+}
+
+function ownValue(record, key) {
+  return isPlainRecord(record) && Object.prototype.hasOwnProperty.call(record, key)
+    ? record[key]
+    : undefined;
+}
+
+export function extractSessionId({ body, headers, endpoint, requestId, allowTestSessionFallback = false }) {
+  const headerCandidate = readHeader(headers, SESSION_HEADER);
+  if (headerCandidate !== undefined) return validateSessionId(headerCandidate, SESSION_HEADER);
+
+  for (const headerName of PROVIDER_SESSION_HEADERS) {
+    const providerHeaderCandidate = readHeader(headers, headerName);
+    if (providerHeaderCandidate !== undefined) return validateSessionId(providerHeaderCandidate, headerName);
+  }
+
+  for (const key of ["session_id", "sessionId", "state_session_id"]) {
+    if (Object.prototype.hasOwnProperty.call(body, key)) {
+      return validateSessionId(body[key], key);
+    }
+  }
+
+  const metadataCandidate = ownValue(body.metadata, APPROVED_METADATA_SESSION_KEY);
+  if (metadataCandidate !== undefined || (isPlainRecord(body.metadata)
+      && Object.prototype.hasOwnProperty.call(body.metadata, APPROVED_METADATA_SESSION_KEY))) {
+    return validateSessionId(metadataCandidate, `metadata.${APPROVED_METADATA_SESSION_KEY}`);
+  }
+
+  for (const key of PROVIDER_METADATA_SESSION_KEYS) {
+    if (Object.prototype.hasOwnProperty.call(body.client_metadata ?? {}, key)) {
+      return validateSessionId(body.client_metadata[key], `client_metadata.${key}`);
+    }
+  }
+
+  // OpenAI documents Responses `conversation` as the stable conversation id.
+  // It is consumed as local routing metadata and is never forwarded upstream.
+  if (endpoint === RESPONSES_PATH && Object.prototype.hasOwnProperty.call(body, "conversation")) {
+    return validateSessionId(body.conversation, "conversation");
+  }
+
+  if (allowTestSessionFallback === true) return validateSessionId(`request-${requestId}`, "test session fallback");
+  throw new GatewayError(
+    400,
+    "missing_session_id",
+    `A stable session id is required in ${SESSION_HEADER}, session-id/thread-id, `
+      + `session_id/sessionId, metadata.${APPROVED_METADATA_SESSION_KEY}, `
+      + "client_metadata.session_id/thread_id, or Responses conversation.",
+  );
 }
 
 function resolveExpectedRevision(body) {

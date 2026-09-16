@@ -43,7 +43,7 @@ function jsonResponse(body, status, requestId, extra = {}) {
   });
 }
 
-function capabilities(upstreamConfigured, coreConfigured) {
+function capabilities(upstreamConfigured, coreConfigured, allowTestSessionFallback) {
   return {
     object: "gateway.capabilities",
     healthy: true,
@@ -54,6 +54,20 @@ function capabilities(upstreamConfigured, coreConfigured) {
       version: "state-patch-action/v1",
       fields: ["state_patch", "action"],
       action_result_is_latest_observation: true,
+    },
+    session: {
+      required: true,
+      header: "x-skill-state-session",
+      provider_headers: ["session-id", "thread-id"],
+      body_fields: ["session_id", "sessionId", "state_session_id"],
+      metadata_fields: [
+        "metadata.skill_state_session_id",
+        "client_metadata.session_id",
+        "client_metadata.thread_id",
+      ],
+      responses_field: "conversation",
+      max_length: 128,
+      test_fallback: allowTestSessionFallback === true,
     },
     streaming: {
       supported: true,
@@ -212,6 +226,7 @@ export function createGateway({
   procedure: configuredProcedure,
   procedureFile,
   allowTestProcedureDefault = false,
+  allowTestSessionFallback = false,
   upstream,
   upstreamBaseUrl = process.env.PROVIDER_UPSTREAM_URL,
   upstreamApiKey = process.env.PROVIDER_UPSTREAM_API_KEY,
@@ -231,7 +246,10 @@ export function createGateway({
     rootDir: stateRootDir,
     procedure,
   });
-  const coreBoundary = createCoreBoundary(core, { trustedProcedureHash: procedureHash });
+  const coreBoundary = createCoreBoundary(core, {
+    trustedProcedureHash: procedureHash,
+    allowTestSessionFallback,
+  });
   const upstreamClient = upstream ?? createUpstreamClient({
     baseUrl: upstreamBaseUrl,
     apiKey: upstreamApiKey,
@@ -244,7 +262,7 @@ export function createGateway({
 
   const gateway = {
     capabilities() {
-      return capabilities(upstreamConfigured, coreConfigured);
+      return capabilities(upstreamConfigured, coreConfigured, allowTestSessionFallback);
     },
 
     async handle(request) {
@@ -279,6 +297,7 @@ export function createGateway({
         const prepared = await coreBoundary.prepare({
           endpoint: url.pathname,
           body,
+          headers: request.headers,
           requestId,
         });
         const upstreamBody = buildUpstreamBody(url.pathname, body, prepared);

@@ -35,14 +35,32 @@ async prepareCall({
 projection/sigma values or a commit method fails before the provider is called;
 there is no prompt-only fallback.
 
+Every production request must carry a stable session id. The gateway resolves it
+in this order: `x-skill-state-session`, the provider-stable `session-id` and
+`thread-id` headers, body `session_id`/`sessionId` (with the legacy
+`state_session_id` alias), `metadata.skill_state_session_id`, Codex's proven
+`client_metadata.session_id`/`client_metadata.thread_id`, and finally the
+documented Responses `conversation` id. Session ids are trimmed, rejected when
+empty or containing control characters, and limited to 128 characters. Missing
+or invalid ids return an explicit 400 error. `allowTestSessionFallback` is an
+explicit `createGateway` test option and must remain disabled in production.
+Provider turn/response ids are per-turn values and are never used as sessions.
+
+The provider session sources are consumed as local routing metadata. The
+gateway never forwards them, `client_metadata`, `prompt_cache_key`, or any
+transcript/state routing field upstream. The Responses `conversation` id is
+documented by [the OpenAI Responses API](https://platform.openai.com/docs/api-reference/responses)
+as the conversation identifier; it is used only to bind the local Sigma.
+
 The request's `action_result` and `tool_result` fields take precedence and are
-normalized as the latest observation. `latest_observation` is used when no
-action/tool result is present. If none is present, the last user input is
-treated as the observation so a compatible client can still start a turn. This
-is the only client content the core receives. The provider request preserves
-the model and supported generation controls, but drops arbitrary request keys;
-client `system`, `instructions`, `prompt`, and context fields cannot override
-the canonical prompt returned by core.
+normalized as the latest observation. A final Chat `role: "tool"` message or a
+Responses `function_call_output`, `tool_result`, or tool-role item is preferred
+over stale user text. `latest_observation` is used when no action/tool result is
+present. If none is present, the last user input is treated as the observation.
+This is the only client content the core receives. The provider request
+preserves the model and supported generation controls, but drops arbitrary
+request keys; client `system`, `instructions`, `prompt`, context, session, and
+conversation fields cannot override the canonical prompt returned by core.
 
 ## Structured response protocol
 

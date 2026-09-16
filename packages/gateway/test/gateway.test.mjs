@@ -4,7 +4,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { createSkillStateCore } from "@skill-state/core";
-import { createGateway } from "../src/index.mjs";
+import {
+  CHAT_COMPLETIONS_PATH,
+  createGateway,
+  extractLatestObservation,
+  extractSessionId,
+  RESPONSES_PATH,
+} from "../src/index.mjs";
 
 const TEST_PROCEDURE = Object.freeze({ id: "gateway-test-procedure", version: 1 });
 
@@ -64,6 +70,7 @@ test("builds P+Sigma+latest O and strips transcript fields before upstream", asy
 
   const response = await gateway.handle(request("/v1/chat/completions", {
     model: "fake-model",
+    session_id: "strip-session",
     stream: false,
     previous_response_id: "old-response-must-not-forward",
     previousResponseId: "old-camel-response-must-not-forward",
@@ -87,6 +94,7 @@ test("builds P+Sigma+latest O and strips transcript fields before upstream", asy
     metadata: {
       messages: [{ role: "user", content: "metadata old transcript" }],
       previous_response_id: "metadata-old-response",
+      skill_state_session_id: "metadata-session-must-not-forward",
     },
     temperature: 0.2,
   }));
@@ -127,6 +135,7 @@ test("builds P+Sigma+latest O and strips transcript fields before upstream", asy
   assert.equal(upstreamCalls[0].body.temperature, 0.2);
   assert.equal("messages" in upstreamCalls[0].body.metadata, false);
   assert.equal("previous_response_id" in upstreamCalls[0].body.metadata, false);
+  assert.equal("skill_state_session_id" in upstreamCalls[0].body.metadata, false);
   assert.equal(upstreamCalls[0].body.messages[0].content.includes("old user turn"), false);
   assert.equal(upstreamCalls[0].body.messages[0].content.includes("nested old transcript"), false);
 
@@ -159,12 +168,252 @@ test("action/tool results take precedence over a stale generic observation", asy
   });
   const response = await gateway.handle(request("/v1/chat/completions", {
     model: "fake-model",
+    session_id: "observation-session",
     latest_observation: { stale: true },
     action_result: { fresh: true },
     messages: [{ role: "user", content: "old" }],
   }));
   assert.equal(response.status, 200);
   assert.deepEqual(coreObservation, { kind: "action_result", value: { fresh: true } });
+});
+
+test("fails closed when a production request has no stable session", async () => {
+  let coreCalls = 0;
+  let upstreamCalls = 0;
+  const gateway = createGateway({
+    procedure: TEST_PROCEDURE,
+    core: {
+      async prepareCall() {
+        coreCalls += 1;
+        return { projection: {}, sigma: {}, prompt: "must-not-run" };
+      },
+      async commitResponse() {},
+    },
+    upstream: async () => {
+      upstreamCalls += 1;
+      return { status: 200, contentType: "application/json", body: "{}" };
+    },
+  });
+
+  const response = await gateway.handle(request("/v1/chat/completions", {
+    model: "fake-model",
+    messages: [{ role: "user", content: "hello" }],
+  }));
+
+  assert.equal(response.status, 400);
+  assert.equal((await response.json()).error.code, "missing_session_id");
+  assert.equal(coreCalls, 0);
+  assert.equal(upstreamCalls, 0);
+});
+
+test("uses the trusted session header first and strips all session routing fields upstream", async () => {
+  let coreInput;
+  let upstreamBody;
+  const gateway = createGateway({
+    procedure: TEST_PROCEDURE,
+    core: {
+      async prepareCall(input) {
+        coreInput = input;
+        return {
+          projection: { procedure: TEST_PROCEDURE },
+          sigma: {},
+          latestObservation: input.latestObservation,
+          prompt: "canonical",
+        };
+      },
+      async commitResponse() {},
+    },
+    upstream: async ({ body }) => {
+      upstreamBody = body;
+      return {
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify(providerChatBody(JSON.stringify({ state_patch: {}, action: null }))),
+      };
+    },
+  });
+
+  const response = await gateway.handle(request("/v1/chat/completions", {
+    model: "fake-model",
+    session_id: "body-session",
+    sessionId: "body-camel-session",
+    state_session_id: "body-legacy-session",
+    metadata: {
+      skill_state_session_id: "metadata-session",
+      client_metadata: { thread_id: "nested-provider-session" },
+      keep: "safe-metadata",
+    },
+    client_metadata: { session_id: "provider-session" },
+    prompt_cache_key: "cache-routing-key",
+    messages: [{ role: "user", content: "hello" }],
+  }, { "x-skill-state-session": "header-session" }));
+
+  assert.equal(response.status, 200);
+  assert.equal(coreInput.sessionId, "header-session");
+  assert.equal("session_id" in upstreamBody, false);
+  assert.equal("sessionId" in upstreamBody, false);
+  assert.equal("state_session_id" in upstreamBody, false);
+  assert.equal("client_metadata" in upstreamBody, false);
+  assert.equal("prompt_cache_key" in upstreamBody, false);
+  assert.equal(upstreamBody.metadata.skill_state_session_id, undefined);
+  assert.equal(upstreamBody.metadata.client_metadata, undefined);
+  assert.equal(upstreamBody.metadata.keep, "safe-metadata");
+});
+
+test("uses final Chat tool and Responses function output as latest observation", () => {
+  const chatTool = {
+    role: "tool",
+    tool_call_id: "call-chat",
+    content: "fresh chat result",
+  };
+  assert.deepEqual(
+    extractLatestObservation({
+      latest_observation: { stale: true },
+      messages: [
+        { role: "user", content: "old user" },
+        { role: "assistant", content: "old assistant" },
+        chatTool,
+      ],
+    }, CHAT_COMPLETIONS_PATH),
+    { kind: "tool_result", value: chatTool },
+  );
+
+  const responsesTool = {
+    type: "function_call_output",
+    call_id: "call-response",
+    output: "fresh Responses result",
+  };
+  assert.deepEqual(
+    extractLatestObservation({
+      input: [
+        { role: "user", content: "old user" },
+        responsesTool,
+      ],
+    }, RESPONSES_PATH),
+    { kind: "tool_result", value: responsesTool },
+  );
+});
+
+test("validates session ids and keeps fallback opt-in for tests", async () => {
+  assert.equal(extractSessionId({
+    body: { metadata: { skill_state_session_id: "metadata-session" } },
+    endpoint: CHAT_COMPLETIONS_PATH,
+    requestId: "metadata-request",
+  }), "metadata-session");
+  assert.equal(extractSessionId({
+    body: { client_metadata: { session_id: "codex-body-session", thread_id: "codex-thread" } },
+    headers: { "session-id": "codex-header-session", "thread-id": "codex-header-thread" },
+    endpoint: CHAT_COMPLETIONS_PATH,
+    requestId: "provider-request",
+  }), "codex-header-session");
+  assert.equal(extractSessionId({
+    body: { client_metadata: { session_id: "codex-body-session", thread_id: "codex-thread" } },
+    headers: { "thread-id": "codex-header-thread" },
+    endpoint: CHAT_COMPLETIONS_PATH,
+    requestId: "provider-thread-request",
+  }), "codex-header-thread");
+  assert.equal(extractSessionId({
+    body: { client_metadata: { session_id: "codex-body-session", thread_id: "codex-thread" } },
+    endpoint: CHAT_COMPLETIONS_PATH,
+    requestId: "provider-body-request",
+  }), "codex-body-session");
+  assert.equal(extractSessionId({
+    body: { conversation: "conv_123" },
+    endpoint: RESPONSES_PATH,
+    requestId: "conversation-request",
+  }), "conv_123");
+
+  const invalidGateway = createGateway({
+    procedure: TEST_PROCEDURE,
+    core: {
+      async prepareCall() {
+        throw new Error("must not prepare");
+      },
+      async commitResponse() {},
+    },
+    upstream: async () => ({ status: 200, contentType: "application/json", body: "{}" }),
+  });
+  const invalid = await invalidGateway.handle(request("/v1/chat/completions", {
+    model: "fake-model",
+    session_id: "x".repeat(129),
+    messages: [{ role: "user", content: "hello" }],
+  }));
+  assert.equal(invalid.status, 400);
+  assert.equal((await invalid.json()).error.code, "invalid_session_id");
+
+  let fallbackSession;
+  const fallbackGateway = createGateway({
+    procedure: TEST_PROCEDURE,
+    allowTestSessionFallback: true,
+    core: {
+      async prepareCall(input) {
+        fallbackSession = input.sessionId;
+        return {
+          projection: { procedure: TEST_PROCEDURE },
+          sigma: {},
+          latestObservation: input.latestObservation,
+          prompt: "canonical",
+        };
+      },
+      async commitResponse() {},
+    },
+    upstream: async () => ({
+      status: 200,
+      contentType: "application/json",
+      body: JSON.stringify(providerChatBody(JSON.stringify({ state_patch: {}, action: null }))),
+    }),
+  });
+  const fallback = await fallbackGateway.handle(request("/v1/chat/completions", {
+    model: "fake-model",
+    messages: [{ role: "user", content: "test only" }],
+  }));
+  assert.equal(fallback.status, 200);
+  assert.match(fallbackSession, /^request-/);
+});
+
+test("isolates concurrent state transitions by session", async () => {
+  const root = await mkdtemp(join(tmpdir(), "skill-state-gateway-concurrent-"));
+  try {
+    const core = createSkillStateCore({
+      rootDir: root,
+      procedure: TEST_PROCEDURE,
+      initialState: { marker: "unset" },
+    });
+    const gateway = createGateway({
+      core,
+      upstream: async ({ body }) => {
+        const envelope = JSON.parse(body.messages[0].content);
+        const marker = envelope.o.latestObservation.value;
+        await new Promise((resolve) => setTimeout(resolve, marker === "A" ? 20 : 0));
+        return {
+          status: 200,
+          contentType: "application/json",
+          body: JSON.stringify(providerChatBody(JSON.stringify({
+            state_patch: { set: { marker } },
+            action: null,
+          }))),
+        };
+      },
+    });
+
+    await Promise.all([
+      gateway.handle(request("/v1/chat/completions", {
+        model: "fake-model",
+        session_id: "session-a",
+        messages: [{ role: "user", content: "A" }],
+      })),
+      gateway.handle(request("/v1/chat/completions", {
+        model: "fake-model",
+        session_id: "session-b",
+        messages: [{ role: "user", content: "B" }],
+      })),
+    ]);
+
+    assert.deepEqual((await core.store.read("session-a")).state, { marker: "A" });
+    assert.deepEqual((await core.store.read("session-b")).state, { marker: "B" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test("refuses a provider call when the core cannot commit a transition", async () => {
@@ -181,7 +430,10 @@ test("refuses a provider call when the core cannot commit a transition", async (
       return { status: 200, contentType: "application/json", body: "{}" };
     },
   });
-  const response = await gateway.handle(request("/v1/chat/completions", { model: "fake-model" }));
+  const response = await gateway.handle(request("/v1/chat/completions", {
+    model: "fake-model",
+    session_id: "commitless-session",
+  }));
   assert.equal(response.status, 503);
   assert.equal((await response.json()).error.code, "core_commit_unavailable");
   assert.equal(upstreamCalls, 0);
@@ -219,6 +471,7 @@ test("rejects an invalid state patch and never exposes its action", async () => 
 
   const response = await gateway.handle(request("/v1/chat/completions", {
     model: "fake-model",
+    session_id: "invalid-output-session",
     messages: [{ role: "user", content: "hello" }],
   }));
 
@@ -260,6 +513,7 @@ test("buffers provider SSE until a valid structured envelope is available", asyn
 
   const response = await gateway.handle(request("/v1/chat/completions", {
     model: "fake-model",
+    session_id: "stream-session",
     stream: true,
     messages: [{ role: "user", content: "hello" }],
   }));
@@ -294,7 +548,12 @@ test("emits Responses SSE event names after validation", async () => {
     },
     upstream: async () => ({ status: 200, contentType: "text/event-stream", body: sse }),
   });
-  const response = await gateway.handle(request("/v1/responses", { model: "fake-model", stream: true, input: "hello" }));
+  const response = await gateway.handle(request("/v1/responses", {
+    model: "fake-model",
+    session_id: "responses-session",
+    stream: true,
+    input: "hello",
+  }));
   assert.equal(response.status, 200);
   const body = await response.text();
   assert.match(body, /event: response\.output_text\.delta/);
@@ -424,6 +683,9 @@ test("health and capabilities expose supported routes", async () => {
   const body = await capabilities.json();
   assert.deepEqual(body.endpoints, ["/v1/chat/completions", "/v1/responses"]);
   assert.equal(body.streaming.validation, "buffered");
+  assert.equal(body.session.required, true);
+  assert.deepEqual(body.session.provider_headers, ["session-id", "thread-id"]);
+  assert.equal(body.session.max_length, 128);
 });
 
 test("gateway fails closed when production procedure configuration is missing", () => {

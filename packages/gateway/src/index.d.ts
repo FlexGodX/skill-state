@@ -68,6 +68,8 @@ export interface GatewayOptions {
   procedure?: string | Record<string, unknown>;
   procedureFile?: string;
   allowTestProcedureDefault?: boolean;
+  /** Test-only compatibility fallback; production requests must carry a stable session id. */
+  allowTestSessionFallback?: boolean;
   upstream?: UpstreamClient | ((request: {
     path: GatewayEndpoint;
     body: Record<string, unknown>;
@@ -90,10 +92,18 @@ export interface Gateway {
 
 export function createGateway(options?: GatewayOptions): Gateway;
 export function createHttpServer(gateway: Gateway): import("node:http").Server;
-export function createCoreBoundary(core?: CoreStateApi, options?: { trustedProcedureHash?: string }): {
+export function createCoreBoundary(core?: CoreStateApi, options?: {
+  trustedProcedureHash?: string;
+  allowTestSessionFallback?: boolean;
+}): {
   ready: boolean;
   assertReady(): void;
-  prepare(args: { endpoint: GatewayEndpoint; body: Record<string, unknown>; requestId: string }): Promise<CoreBuildResult & { source: string }>;
+  prepare(args: {
+    endpoint: GatewayEndpoint;
+    body: Record<string, unknown>;
+    headers?: Headers | Record<string, string | string[] | undefined>;
+    requestId: string;
+  }): Promise<CoreBuildResult & { source: string }>;
   commit(args: { endpoint: GatewayEndpoint; prepared: CoreBuildResult; envelope: { state_patch: Record<string, unknown>; action: unknown } }): Promise<unknown>;
 };
 export function buildUpstreamBody(
@@ -102,6 +112,15 @@ export function buildUpstreamBody(
   prepared: CoreBuildResult,
 ): Record<string, unknown>;
 export function extractLatestObservation(body: Record<string, unknown>, endpoint: GatewayEndpoint): unknown;
+export function extractSessionId(args: {
+  body: Record<string, unknown>;
+  headers?: Headers | Record<string, string | string[] | undefined>;
+  endpoint: GatewayEndpoint;
+  requestId: string;
+  allowTestSessionFallback?: boolean;
+}): string;
+export const SESSION_HEADER: "x-skill-state-session";
+export const MAX_SESSION_ID_LENGTH: 128;
 export function pickRequestControls(body: Record<string, unknown>): Record<string, unknown>;
 export function sanitizeBoundaryValue(value: unknown): unknown;
 export function createUpstreamClient(options?: Record<string, unknown>): UpstreamClient;
