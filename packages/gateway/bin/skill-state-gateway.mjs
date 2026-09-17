@@ -1,16 +1,28 @@
 #!/usr/bin/env node
 
-import { chmodSync, lstatSync, mkdirSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { chmodSync, lstatSync, mkdirSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import process from "node:process";
-import { createGateway, createHttpServer } from "../src/index.mjs";
+import {
+  CLIENT_TEXT_MODES,
+  createGateway,
+  createHttpServer,
+  PROMPT_CONTROLS_MODES,
+  STRUCTURED_OUTPUT_MODES,
+  UPSTREAM_REASONING_EFFORTS,
+  UPSTREAM_API_MODES,
+  UPSTREAM_STREAM_MODES,
+  validateEnvelopeSchema,
+} from "../src/index.mjs";
 
 const DEFAULT_HOST = "127.0.0.1";
 const DEFAULT_PORT = 8787;
 const DEFAULT_UPSTREAM = "http://127.0.0.1:1234/v1";
 const DEFAULT_STATE_DIR = join(homedir(), ".local", "share", "skill-state");
 const DEFAULT_PROCEDURE_DIR = join(homedir(), ".config", "skill-state");
+const MAX_ENVELOPE_SCHEMA_BYTES = 64 * 1024;
 
 export class GatewayCliError extends Error {
   constructor(message, code = "gateway_cli_error") {
@@ -38,6 +50,103 @@ function parsePositiveInteger(value, name) {
     throw new GatewayCliError(`${name} must be a positive integer`, "invalid_integer");
   }
   return parsed;
+}
+
+function parseEnumOption(value, name, allowed, code) {
+  const normalized = value.trim().toLowerCase();
+  if (!allowed.includes(normalized)) {
+    throw new GatewayCliError(`${name} must be one of: ${allowed.join(", ")}`, code);
+  }
+  return normalized;
+}
+
+function parseReasoningEffort(value) {
+  if (value === undefined || value.trim() === "") return undefined;
+  return parseEnumOption(
+    value,
+    "SKILL_STATE_UPSTREAM_REASONING_EFFORT",
+    UPSTREAM_REASONING_EFFORTS,
+    "invalid_reasoning_effort",
+  );
+}
+
+function parseStructuredOutputMode(value) {
+  if (value === undefined || value.trim() === "") return "off";
+  return parseEnumOption(value, "SKILL_STATE_STRUCTURED_OUTPUT", STRUCTURED_OUTPUT_MODES, "invalid_structured_output_mode");
+}
+
+function parseDropTools(value, structuredOutput) {
+  if (value === undefined || value.trim() === "") return structuredOutput === "json_schema";
+  return parseEnumOption(value, "SKILL_STATE_DROP_TOOLS", ["true", "false"], "invalid_drop_tools") === "true";
+}
+
+function parseUpstreamStream(value) {
+  if (value === undefined || value.trim() === "") return "auto";
+  return parseEnumOption(value, "SKILL_STATE_UPSTREAM_STREAM", UPSTREAM_STREAM_MODES, "invalid_upstream_stream");
+}
+
+function parseClientText(value) {
+  if (value === undefined || value.trim() === "") return "envelope";
+  return parseEnumOption(value, "SKILL_STATE_CLIENT_TEXT", CLIENT_TEXT_MODES, "invalid_client_text");
+}
+
+function parseUpstreamApi(value) {
+  if (value === undefined || value.trim() === "") return "same";
+  return parseEnumOption(value, "SKILL_STATE_UPSTREAM_API", UPSTREAM_API_MODES, "invalid_upstream_api");
+}
+
+function parsePromptControls(value) {
+  if (value === undefined || value.trim() === "") return "all";
+  return parseEnumOption(value, "SKILL_STATE_PROMPT_CONTROLS", PROMPT_CONTROLS_MODES, "invalid_prompt_controls");
+}
+
+function optionalPath(value) {
+  return value === undefined || value.trim() === "" ? undefined : resolve(value);
+}
+
+/**
+ * Read the operator's upstream structured-output schema. It replaces only the
+ * schema sent upstream; the gateway's envelope validation is unchanged.
+ */
+export function loadEnvelopeSchemaFile(path) {
+  const invalid = (reason) => new GatewayCliError(
+    `SKILL_STATE_ENVELOPE_SCHEMA_FILE ${reason}`,
+    "invalid_envelope_schema",
+  );
+  let info;
+  try {
+    info = lstatSync(path);
+  } catch {
+    throw invalid("does not exist");
+  }
+  if (info.isSymbolicLink() || !info.isFile()) throw invalid("must be a regular file (symlinks are refused)");
+  if (info.size > MAX_ENVELOPE_SCHEMA_BYTES) throw invalid("exceeds 64 KB");
+  const raw = readFileSync(path);
+  if (raw.length > MAX_ENVELOPE_SCHEMA_BYTES) throw invalid("exceeds 64 KB");
+  let schema;
+  try {
+    schema = JSON.parse(raw.toString("utf8"));
+    validateEnvelopeSchema(schema);
+  } catch (error) {
+    throw invalid(error instanceof TypeError ? `is invalid: ${error.message}` : "is not valid JSON");
+  }
+  return Object.freeze({
+    schema,
+    sha256: createHash("sha256").update(raw).digest("hex").slice(0, 12),
+  });
+}
+
+function withEnvelopeSchema(config) {
+  if (!config.envelopeSchemaFile) return config;
+  const loaded = loadEnvelopeSchemaFile(config.envelopeSchemaFile);
+  return Object.freeze({ ...config, envelopeSchema: loaded.schema, envelopeSchemaSha256: loaded.sha256 });
+}
+
+function effectiveUpstreamStream(config) {
+  const mode = config.upstreamStream ?? "auto";
+  if (mode === "true") return "client";
+  if (mode === "false") return "off";
+  return config.structuredOutput === "json_schema" ? "off" : "client";
 }
 
 function firstExistingProcedureFile(directory) {
@@ -77,6 +186,8 @@ export function parseGatewayConfig(env = process.env) {
     throw new GatewayCliError("PROVIDER_UPSTREAM_URL must not contain credentials", "upstream_credentials");
   }
 
+  const structuredOutput = parseStructuredOutputMode(env.SKILL_STATE_STRUCTURED_OUTPUT);
+
   return Object.freeze({
     host,
     port: parsePort(env.SKILL_STATE_PORT ?? String(DEFAULT_PORT)),
@@ -89,14 +200,23 @@ export function parseGatewayConfig(env = process.env) {
       "PROVIDER_UPSTREAM_TIMEOUT_MS",
     ),
     defaultModel: env.SKILL_STATE_MODEL,
+    upstreamReasoningEffort: parseReasoningEffort(env.SKILL_STATE_UPSTREAM_REASONING_EFFORT),
+    structuredOutput,
+    dropTools: parseDropTools(env.SKILL_STATE_DROP_TOOLS, structuredOutput),
+    upstreamStream: parseUpstreamStream(env.SKILL_STATE_UPSTREAM_STREAM),
+    clientText: parseClientText(env.SKILL_STATE_CLIENT_TEXT),
+    debugDir: optionalPath(env.SKILL_STATE_DEBUG_DIR),
+    upstreamApi: parseUpstreamApi(env.SKILL_STATE_UPSTREAM_API),
+    envelopeSchemaFile: optionalPath(env.SKILL_STATE_ENVELOPE_SCHEMA_FILE),
+    promptControls: parsePromptControls(env.SKILL_STATE_PROMPT_CONTROLS),
   });
 }
 
-export function ensurePrivateDirectory(directory) {
+export function ensurePrivateDirectory(directory, label = "state directory", code = "invalid_state_dir") {
   mkdirSync(directory, { recursive: true, mode: 0o700 });
   const info = lstatSync(directory);
   if (!info.isDirectory() || info.isSymbolicLink()) {
-    throw new GatewayCliError(`state directory is not a private directory: ${directory}`, "invalid_state_dir");
+    throw new GatewayCliError(`${label} is not a private directory: ${directory}`, code);
   }
   chmodSync(directory, 0o700);
 }
@@ -125,11 +245,24 @@ export function safeStartupSummary(config) {
     procedureFile: config.procedureFile,
     model: config.defaultModel ?? "request model required",
     apiKeyConfigured: Boolean(config.upstreamApiKey),
+    reasoningEffort: config.upstreamReasoningEffort ?? null,
+    structuredOutput: config.structuredOutput ?? "off",
+    dropTools: config.dropTools ?? config.structuredOutput === "json_schema",
+    upstreamStream: config.upstreamStream ?? "auto",
+    upstreamStreamEffective: effectiveUpstreamStream(config),
+    clientText: config.clientText ?? "envelope",
+    debugDir: config.debugDir ?? null,
+    upstreamApi: config.upstreamApi ?? "same",
+    envelopeSchemaFile: config.envelopeSchemaFile ?? null,
+    envelopeSchemaSha256: config.envelopeSchemaSha256 ?? null,
+    promptControls: config.promptControls ?? "all",
   };
 }
 
-export async function startGateway(config = parseGatewayConfig()) {
+export async function startGateway(parsedConfig = parseGatewayConfig()) {
+  const config = withEnvelopeSchema(parsedConfig);
   ensurePrivateDirectory(config.stateDir);
+  if (config.debugDir) ensurePrivateDirectory(config.debugDir, "SKILL_STATE_DEBUG_DIR", "invalid_debug_dir");
   assertProcedureFile(config.procedureFile);
 
   const gateway = createGateway({
@@ -139,6 +272,15 @@ export async function startGateway(config = parseGatewayConfig()) {
     upstreamApiKey: config.upstreamApiKey,
     upstreamTimeoutMs: config.upstreamTimeoutMs,
     defaultModel: config.defaultModel,
+    upstreamReasoningEffort: config.upstreamReasoningEffort,
+    structuredOutput: config.structuredOutput,
+    dropTools: config.dropTools,
+    upstreamStream: config.upstreamStream,
+    clientText: config.clientText,
+    debugDir: config.debugDir,
+    upstreamApi: config.upstreamApi,
+    envelopeSchema: config.envelopeSchema,
+    promptControls: config.promptControls,
   });
   const server = createHttpServer(gateway);
   await new Promise((resolveListen, rejectListen) => {
@@ -155,15 +297,17 @@ export async function startGateway(config = parseGatewayConfig()) {
 }
 
 export async function main(argv = process.argv.slice(2), env = process.env) {
-  const config = parseGatewayConfig(env);
+  const parsedConfig = parseGatewayConfig(env);
   if (argv.includes("--check")) {
+    const config = withEnvelopeSchema(parsedConfig);
     ensurePrivateDirectory(config.stateDir);
+    if (config.debugDir) ensurePrivateDirectory(config.debugDir, "SKILL_STATE_DEBUG_DIR", "invalid_debug_dir");
     assertProcedureFile(config.procedureFile);
     process.stdout.write(`${JSON.stringify(safeStartupSummary(config))}\n`);
     return 0;
   }
 
-  const started = await startGateway(config);
+  const started = await startGateway(parsedConfig);
   process.stdout.write(`${JSON.stringify({ status: "listening", ...safeStartupSummary(started.config) })}\n`);
   return started;
 }
