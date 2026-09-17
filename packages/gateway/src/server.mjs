@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { createSkillStateCore, hashProcedure, normalizeProcedure } from "@skill-state/core";
 import {
   CHAT_COMPLETIONS_PATH,
+  CLIENT_TEXT_MODES,
   createChatResponse,
   createChatStream,
   createResponsesResponse,
@@ -13,12 +14,21 @@ import {
   GatewayError,
   parseStructuredOutput,
   RESPONSES_PATH,
+  responsesUsageFromChatUsage,
   SUPPORTED_PATHS,
 } from "./protocol.mjs";
-import { buildUpstreamBody, createCoreBoundary } from "./core-boundary.mjs";
+import {
+  buildUpstreamBody,
+  createCoreBoundary,
+  resolveUpstreamOverrides,
+  upstreamEndpointFor,
+} from "./core-boundary.mjs";
 import { createUpstreamClient } from "./upstream.mjs";
+import { createDebugCapture } from "./debug-capture.mjs";
 
 const MAX_REQUEST_BYTES = 4 * 1024 * 1024;
+const MODELS_PATHS = Object.freeze(["/v1/models", "/models"]);
+const UPSTREAM_MODELS_PATH = "/v1/models";
 
 function newRequestId() {
   if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
@@ -152,6 +162,24 @@ async function callInjectedUpstream(upstream, path, body, options) {
   };
 }
 
+async function proxyModels(upstream, url, requestId, signal) {
+  const provider = await callInjectedUpstream(upstream, UPSTREAM_MODELS_PATH, undefined, {
+    requestId,
+    signal,
+    method: "GET",
+    search: url.search,
+  });
+  try {
+    JSON.parse(provider.body);
+  } catch {
+    throw new GatewayError(502, "invalid_upstream_response", "Provider upstream returned invalid JSON.");
+  }
+  return new Response(provider.body, {
+    status: 200,
+    headers: responseHeaders(requestId, { "content-type": "application/json; charset=utf-8" }),
+  });
+}
+
 function parseNonStreamingProviderBody(endpoint, body) {
   let payload;
   try {
@@ -160,7 +188,27 @@ function parseNonStreamingProviderBody(endpoint, body) {
     throw new GatewayError(502, "invalid_upstream_response", "Provider upstream returned invalid JSON.");
   }
   const text = extractTextFromPayload(endpoint, payload);
-  return { text, payload };
+  return { text, upstreamPayload: payload, metadata: {} };
+}
+
+/**
+ * Client output arguments. When a /v1/responses client was served by a chat
+ * upstream, the chat payload is not a Responses payload: keep the requested
+ * model, let the Responses emitter mint its own id, and map usage.
+ */
+function clientOutputSource(clientEndpoint, upstreamEndpoint, extracted) {
+  if (clientEndpoint === upstreamEndpoint) {
+    return { upstreamPayload: extracted.upstreamPayload, metadata: extracted.metadata };
+  }
+  const payload = extracted.upstreamPayload;
+  const created = payload?.created ?? extracted.metadata?.created;
+  return {
+    upstreamPayload: undefined,
+    metadata: {
+      created: Number.isFinite(created) ? created : undefined,
+      usage: responsesUsageFromChatUsage(payload?.usage ?? extracted.metadata?.usage),
+    },
+  };
 }
 
 function endpointResponse(endpoint, args) {
@@ -234,7 +282,28 @@ export function createGateway({
   upstreamFetch,
   upstreamHeaders,
   defaultModel,
+  upstreamReasoningEffort,
+  structuredOutput,
+  dropTools,
+  upstreamStream,
+  clientText = "envelope",
+  debugDir,
+  upstreamApi,
+  envelopeSchema,
+  promptControls = "all",
 } = {}) {
+  const upstreamOverrides = resolveUpstreamOverrides({
+    reasoningEffort: upstreamReasoningEffort,
+    structuredOutput,
+    dropTools,
+    upstreamStream,
+    upstreamApi,
+    envelopeSchema: envelopeSchema === undefined ? undefined : structuredClone(envelopeSchema),
+  });
+  if (!CLIENT_TEXT_MODES.includes(clientText)) {
+    throw new TypeError(`clientText must be one of: ${CLIENT_TEXT_MODES.join(", ")}`);
+  }
+  const debugCapture = createDebugCapture(debugDir);
   const procedure = resolveTrustedProcedure({
     configuredProcedure,
     configuredCore,
@@ -249,6 +318,8 @@ export function createGateway({
   const coreBoundary = createCoreBoundary(core, {
     trustedProcedureHash: procedureHash,
     allowTestSessionFallback,
+    promptControls,
+    dropTools: upstreamOverrides.dropTools,
   });
   const upstreamClient = upstream ?? createUpstreamClient({
     baseUrl: upstreamBaseUrl,
@@ -281,6 +352,10 @@ export function createGateway({
         if (method === "GET" && url.pathname === "/capabilities") {
           return jsonResponse(gateway.capabilities(), 200, requestId);
         }
+        if (method === "GET" && MODELS_PATHS.includes(url.pathname)) {
+          // Model discovery is a stateless passthrough: no session or core.
+          return await proxyModels(upstreamClient, url, requestId, request.signal);
+        }
         if (!SUPPORTED_PATHS.includes(url.pathname)) {
           throw new GatewayError(404, "not_found", "Gateway route was not found.");
         }
@@ -300,27 +375,44 @@ export function createGateway({
           headers: request.headers,
           requestId,
         });
-        const upstreamBody = buildUpstreamBody(url.pathname, body, prepared);
-        const provider = await callInjectedUpstream(upstreamClient, url.pathname, upstreamBody, {
+        const upstreamPath = upstreamEndpointFor(url.pathname, upstreamOverrides);
+        const upstreamBody = buildUpstreamBody(url.pathname, body, prepared, upstreamOverrides);
+        const provider = await callInjectedUpstream(upstreamClient, upstreamPath, upstreamBody, {
           requestId,
           signal: request.signal,
         });
 
+        // The provider may be called non-streaming even for a streaming client
+        // (see upstreamStream), and on a different API (see upstreamApi).
+        // Extraction follows the upstream call; the client representation
+        // follows the client's request.
+        const extracted = upstreamBody.stream === true
+          ? extractTextFromStream(upstreamPath, provider.body, provider.contentType)
+          : parseNonStreamingProviderBody(upstreamPath, provider.body);
+        let envelope;
+        try {
+          envelope = parseStructuredOutput(extracted.text);
+        } catch (error) {
+          if (debugCapture && error instanceof GatewayError && error.code === "invalid_structured_output") {
+            await debugCapture.recordInvalidOutput(requestId, extracted.text);
+          }
+          throw error;
+        }
+        await coreBoundary.commit({
+          endpoint: url.pathname,
+          prepared,
+          envelope,
+        });
+        const output = {
+          envelope,
+          ...clientOutputSource(url.pathname, upstreamPath, extracted),
+          model: body.model,
+          requestId,
+          clientText,
+        };
+
         if (body.stream === true) {
-          const extracted = extractTextFromStream(url.pathname, provider.body, provider.contentType);
-          const envelope = parseStructuredOutput(extracted.text);
-          await coreBoundary.commit({
-            endpoint: url.pathname,
-            prepared,
-            envelope,
-          });
-          const streamBody = endpointStream(url.pathname, {
-            envelope,
-            upstreamPayload: extracted.upstreamPayload,
-            metadata: extracted.metadata,
-            model: body.model,
-            requestId,
-          });
+          const streamBody = endpointStream(url.pathname, output);
           return new Response(streamBody, {
             status: 200,
             headers: responseHeaders(requestId, {
@@ -332,19 +424,7 @@ export function createGateway({
           });
         }
 
-        const extracted = parseNonStreamingProviderBody(url.pathname, provider.body);
-        const envelope = parseStructuredOutput(extracted.text);
-        await coreBoundary.commit({
-          endpoint: url.pathname,
-          prepared,
-          envelope,
-        });
-        return jsonResponse(endpointResponse(url.pathname, {
-          envelope,
-          upstreamPayload: extracted.payload,
-          model: body.model,
-          requestId,
-        }), 200, requestId);
+        return jsonResponse(endpointResponse(url.pathname, output), 200, requestId);
       } catch (error) {
         const { status, body } = errorResponseBody(error, requestId);
         return jsonResponse(body, status, requestId);

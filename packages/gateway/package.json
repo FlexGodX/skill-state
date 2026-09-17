@@ -19,7 +19,7 @@
   "scripts": {
     "start": "node ./bin/skill-state-gateway.mjs",
     "test": "node --test test/*.test.mjs",
-    "typecheck": "node --check bin/skill-state-gateway.mjs && node --check src/core-boundary.mjs && node --check src/protocol.mjs && node --check src/upstream.mjs && node --check src/server.mjs && node --check src/index.mjs"
+    "typecheck": "node --check bin/skill-state-gateway.mjs && node --check src/core-boundary.mjs && node --check src/protocol.mjs && node --check src/upstream.mjs && node --check src/debug-capture.mjs && node --check src/server.mjs && node --check src/index.mjs"
   },
   "engines": {
     "node": ">=20"

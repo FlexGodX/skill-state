@@ -2,7 +2,7 @@ import { GatewayError } from "./protocol.mjs";
 
 const MAX_UPSTREAM_RESPONSE_BYTES = 8 * 1024 * 1024;
 
-function joinUrl(baseUrl, path) {
+function joinUrl(baseUrl, path, search = "") {
   let parsed;
   try {
     parsed = new URL(String(baseUrl ?? ""));
@@ -20,10 +20,13 @@ function joinUrl(baseUrl, path) {
   const base = parsed.toString().replace(/\/+$/, "");
   if (!base) throw new GatewayError(503, "upstream_unavailable", "Provider upstream URL is not configured.");
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
+  const query = typeof search === "string" && search !== "" && search !== "?"
+    ? (search.startsWith("?") ? search : `?${search}`)
+    : "";
   if (base.endsWith("/v1") && normalizedPath.startsWith("/v1/")) {
-    return `${base}${normalizedPath.slice(3)}`;
+    return `${base}${normalizedPath.slice(3)}${query}`;
   }
-  return `${base}${normalizedPath}`;
+  return `${base}${normalizedPath}${query}`;
 }
 
 export function createUpstreamClient({
@@ -45,8 +48,13 @@ export function createUpstreamClient({
   }
 
   return {
-    async request(path, body, { requestId, signal: parentSignal } = {}) {
-      const url = joinUrl(baseUrl, path);
+    /**
+     * POST `body` as JSON, or GET without a body when `method` is "GET". Both
+     * share the timeout, response-size limit, and authorization handling.
+     */
+    async request(path, body, { requestId, signal: parentSignal, method = "POST", search } = {}) {
+      const isGet = method === "GET";
+      const url = joinUrl(baseUrl, path, search);
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeoutMs);
       let removeParentAbort;
@@ -59,7 +67,7 @@ export function createUpstreamClient({
       }
 
       const headers = {
-        "content-type": "application/json",
+        ...(isGet ? {} : { "content-type": "application/json" }),
         accept: body?.stream === true ? "text/event-stream, application/json" : "application/json",
         ...configuredHeaders,
       };
@@ -69,9 +77,9 @@ export function createUpstreamClient({
       let response;
       try {
         response = await fetchImpl(url, {
-          method: "POST",
+          method: isGet ? "GET" : "POST",
           headers,
-          body: JSON.stringify(body),
+          ...(isGet ? {} : { body: JSON.stringify(body) }),
           signal: controller.signal,
         });
       } catch (cause) {

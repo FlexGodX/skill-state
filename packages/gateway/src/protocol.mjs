@@ -1,5 +1,7 @@
 const MAX_STRUCTURED_OUTPUT_BYTES = 2 * 1024 * 1024;
 const MAX_STRUCTURED_DEPTH = 40;
+const MAX_ACTION_TYPE_LENGTH = 128;
+const ENVELOPE_FIELDS = Object.freeze(["state_patch", "action"]);
 
 export const CHAT_COMPLETIONS_PATH = "/v1/chat/completions";
 export const RESPONSES_PATH = "/v1/responses";
@@ -112,6 +114,48 @@ function checkStructuredOutputSize(value) {
   }
 }
 
+function deepFreeze(value) {
+  if (value && typeof value === "object") {
+    for (const item of Object.values(value)) deepFreeze(item);
+    Object.freeze(value);
+  }
+  return value;
+}
+
+/**
+ * JSON Schema for the envelope accepted by validateStructuredEnvelope. Both
+ * derive their required fields and action.type bounds from the constants
+ * above, so the upstream structured-output contract cannot drift from the
+ * validator. Extra keys are tolerated by the validator (and dropped), so the
+ * schema does not forbid them either; depth/size/prototype-key limits remain
+ * validator-only because JSON Schema cannot express them.
+ */
+export const ENVELOPE_SCHEMA = deepFreeze({
+  type: "object",
+  properties: {
+    state_patch: { type: "object" },
+    action: {
+      anyOf: [
+        { type: "null" },
+        {
+          type: "object",
+          properties: {
+            type: {
+              type: "string",
+              minLength: 1,
+              maxLength: MAX_ACTION_TYPE_LENGTH,
+              pattern: "\\S",
+            },
+            payload: {},
+          },
+          required: ["type"],
+        },
+      ],
+    },
+  },
+  required: [...ENVELOPE_FIELDS],
+});
+
 /**
  * Validate the provider's state/action protocol before exposing either part
  * to callers. The state patch is deliberately a JSON merge patch object; a
@@ -125,19 +169,14 @@ export function validateStructuredEnvelope(value) {
       "Model output must be a JSON object.",
     );
   }
-  if (!Object.prototype.hasOwnProperty.call(value, "state_patch")) {
-    throw new GatewayError(
-      502,
-      "invalid_structured_output",
-      "Model output is missing state_patch.",
-    );
-  }
-  if (!Object.prototype.hasOwnProperty.call(value, "action")) {
-    throw new GatewayError(
-      502,
-      "invalid_structured_output",
-      "Model output is missing action.",
-    );
+  for (const field of ENVELOPE_FIELDS) {
+    if (!Object.prototype.hasOwnProperty.call(value, field)) {
+      throw new GatewayError(
+        502,
+        "invalid_structured_output",
+        `Model output is missing ${field}.`,
+      );
+    }
   }
 
   const statePatch = value.state_patch;
@@ -157,7 +196,7 @@ export function validateStructuredEnvelope(value) {
         "action must be null or an object with a non-empty type.",
       );
     }
-    if (action.type.length > 128) {
+    if (action.type.length > MAX_ACTION_TYPE_LENGTH) {
       throw new GatewayError(
         502,
         "invalid_structured_output",
@@ -177,6 +216,21 @@ export function validateStructuredEnvelope(value) {
     state_patch: statePatch,
     action,
   };
+}
+
+/**
+ * Reasoning models may inline their chain of thought as <think>...</think>.
+ * Complete blocks are removed wherever they occur. A leading block that was
+ * never closed is removed up to the first "{" only when no closing tag exists.
+ */
+function stripThinkBlocks(text) {
+  const withoutBlocks = text.replace(/<think\b[^>]*>[\s\S]*?<\/think\s*>/gi, "");
+  const leading = withoutBlocks.trimStart();
+  if (/^<think\b[^>]*>/i.test(leading) && !/<\/think\s*>/i.test(withoutBlocks)) {
+    const firstBrace = leading.indexOf("{");
+    return firstBrace < 0 ? "" : leading.slice(firstBrace);
+  }
+  return withoutBlocks;
 }
 
 function removeCodeFence(text) {
@@ -209,7 +263,7 @@ export function parseStructuredOutput(text) {
   }
 
   const candidates = [];
-  const cleaned = removeCodeFence(text);
+  const cleaned = removeCodeFence(stripThinkBlocks(text));
   candidates.push(cleaned);
   const extracted = findJsonObject(cleaned);
   if (extracted && extracted !== cleaned) candidates.push(extracted);
@@ -233,6 +287,10 @@ export function parseStructuredOutput(text) {
   return validateStructuredEnvelope(parsed);
 }
 
+function isReasoningType(type) {
+  return typeof type === "string" && type.toLowerCase().includes("reasoning");
+}
+
 function textFromContent(content) {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
@@ -240,6 +298,7 @@ function textFromContent(content) {
     .map((part) => {
       if (typeof part === "string") return part;
       if (!part || typeof part !== "object") return "";
+      if (isReasoningType(part.type)) return "";
       if (typeof part.text === "string") return part.text;
       if (typeof part.output_text === "string") return part.output_text;
       if (typeof part.content === "string") return part.content;
@@ -248,22 +307,33 @@ function textFromContent(content) {
     .join("");
 }
 
-function textFromChatPayload(payload) {
-  if (!payload || typeof payload !== "object") return "";
-  if (Array.isArray(payload.choices)) {
-    return payload.choices
-      .map((choice) => textFromContent(choice?.message?.content ?? choice?.delta?.content ?? choice?.text))
-      .join("");
-  }
-  return "";
+function isPrimaryChoice(choice) {
+  return choice?.index === undefined || choice?.index === 0;
 }
 
+/**
+ * Only the first choice is the model answer; additional choices (n > 1) must
+ * never be concatenated into it. `reasoning_content` is deliberately ignored.
+ */
+function textFromChatPayload(payload) {
+  if (!payload || typeof payload !== "object") return "";
+  if (!Array.isArray(payload.choices) || payload.choices.length === 0) return "";
+  const choice = payload.choices.find(isPrimaryChoice) ?? payload.choices[0];
+  return textFromContent(choice?.message?.content ?? choice?.delta?.content ?? choice?.text);
+}
+
+/**
+ * Responses `output` interleaves reasoning, tool-call, and message items. Only
+ * assistant message items carry the answer; reasoning text may contain braces
+ * that would otherwise corrupt the JSON search.
+ */
 function textFromResponsesPayload(payload) {
   if (!payload || typeof payload !== "object") return "";
   if (typeof payload.output_text === "string") return payload.output_text;
   if (Array.isArray(payload.output)) {
     return payload.output
-      .map((item) => textFromContent(item?.content ?? item?.text ?? item?.output_text))
+      .filter((item) => item?.type === "message" && (item.role === undefined || item.role === "assistant"))
+      .map((item) => textFromContent(item.content))
       .join("");
   }
   return "";
@@ -336,6 +406,27 @@ function usageFromPayload(value) {
   return Object.keys(usage).length > 0 ? usage : undefined;
 }
 
+/**
+ * Map Chat Completions usage (raw or as normalized by usageFromPayload) to the
+ * Responses usage shape for a /v1/responses client served by a chat upstream.
+ */
+export function responsesUsageFromChatUsage(usage) {
+  if (!usage || typeof usage !== "object") return undefined;
+  const mapped = {};
+  if (Number.isFinite(usage.prompt_tokens)) mapped.input_tokens = usage.prompt_tokens;
+  if (Number.isFinite(usage.completion_tokens)) mapped.output_tokens = usage.completion_tokens;
+  if (Number.isFinite(usage.total_tokens)) {
+    mapped.total_tokens = usage.total_tokens;
+  } else if (mapped.input_tokens !== undefined && mapped.output_tokens !== undefined) {
+    mapped.total_tokens = mapped.input_tokens + mapped.output_tokens;
+  }
+  const cached = usage.prompt_tokens_details?.cached_tokens;
+  const reasoning = usage.completion_tokens_details?.reasoning_tokens;
+  if (Number.isFinite(cached)) mapped.input_tokens_details = { cached_tokens: cached };
+  if (Number.isFinite(reasoning)) mapped.output_tokens_details = { reasoning_tokens: reasoning };
+  return Object.keys(mapped).length > 0 ? mapped : undefined;
+}
+
 export function extractTextFromStream(endpoint, body, contentType = "") {
   if (!looksLikeSse(body, contentType)) {
     let payload;
@@ -375,18 +466,23 @@ export function extractTextFromStream(endpoint, body, contentType = "") {
       usage: metadata.usage ?? usageFromPayload(data?.usage ?? data?.response?.usage),
     };
     if (endpoint === CHAT_COMPLETIONS_PATH) {
-      const chunk = data?.choices?.[0]?.delta?.content ?? data?.choices?.[0]?.text;
+      // Chunks for other choices (n > 1) carry their own index; only index 0
+      // is the answer. delta.reasoning_content is never read.
+      const choice = Array.isArray(data?.choices) ? data.choices.find(isPrimaryChoice) : undefined;
+      const chunk = choice?.delta?.content ?? choice?.text;
       if (typeof chunk === "string") chunks.push(chunk);
-      const messageText = data?.choices?.[0]?.message?.content;
+      const messageText = choice?.message?.content;
       if (typeof messageText === "string" && chunks.length === 0) chunks.push(messageText);
     } else {
+      const eventType = typeof data?.type === "string" ? data.type : record.event;
+      if (isReasoningType(eventType) || isReasoningType(record.event)) continue;
       if (typeof data?.delta === "string" &&
-          (record.event.includes("output_text") || data?.type?.includes("output_text"))) {
+          (record.event.includes("output_text") || eventType.includes("output_text"))) {
         chunks.push(data.delta);
       }
       if (typeof data?.output_text === "string") completedText = data.output_text;
       if (typeof data?.response?.output_text === "string") completedText = data.response.output_text;
-      const outputText = textFromResponsesPayload(data);
+      const outputText = textFromResponsesPayload(data) || textFromResponsesPayload(data?.response);
       if (outputText && chunks.length === 0) completedText = outputText;
     }
   }
@@ -399,7 +495,28 @@ export function extractTextFromStream(endpoint, body, contentType = "") {
   };
 }
 
-export function createChatResponse({ envelope, upstreamPayload, metadata = {}, model, requestId }) {
+export const CLIENT_TEXT_MODES = Object.freeze(["envelope", "action"]);
+
+const CLIENT_TEXT_PAYLOAD_FIELDS = Object.freeze({ respond: "text", ask: "question" });
+
+/**
+ * Assistant text shown to the client. "envelope" (default) is the compact JSON
+ * envelope. "action" shows `payload.text` for respond and `payload.question`
+ * for ask, falling back to the envelope for other actions or non-string
+ * payload fields. Top-level `state_patch`/`action` fields are unaffected.
+ */
+export function clientTextForEnvelope(envelope, mode = "envelope") {
+  if (mode === "action" && envelope.action !== null) {
+    const field = Object.prototype.hasOwnProperty.call(CLIENT_TEXT_PAYLOAD_FIELDS, envelope.action.type)
+      ? CLIENT_TEXT_PAYLOAD_FIELDS[envelope.action.type]
+      : undefined;
+    const text = field && isPlainRecord(envelope.action.payload) ? envelope.action.payload[field] : undefined;
+    if (typeof text === "string") return text;
+  }
+  return JSON.stringify(envelope);
+}
+
+export function createChatResponse({ envelope, upstreamPayload, metadata = {}, model, requestId, clientText }) {
   const id = upstreamPayload?.id ?? metadata.id ?? `chatcmpl-${requestId}`;
   const created = upstreamPayload?.created ?? metadata.created ?? Math.floor(Date.now() / 1000);
   const response = {
@@ -412,7 +529,7 @@ export function createChatResponse({ envelope, upstreamPayload, metadata = {}, m
         index: 0,
         message: {
           role: "assistant",
-          content: JSON.stringify(envelope),
+          content: clientTextForEnvelope(envelope, clientText),
         },
         finish_reason: "stop",
       },
@@ -425,10 +542,10 @@ export function createChatResponse({ envelope, upstreamPayload, metadata = {}, m
   return response;
 }
 
-export function createResponsesResponse({ envelope, upstreamPayload, metadata = {}, model, requestId }) {
+export function createResponsesResponse({ envelope, upstreamPayload, metadata = {}, model, requestId, clientText }) {
   const id = upstreamPayload?.id ?? metadata.id ?? `resp-${requestId}`;
   const createdAt = upstreamPayload?.created_at ?? metadata.created ?? Math.floor(Date.now() / 1000);
-  const text = JSON.stringify(envelope);
+  const text = clientTextForEnvelope(envelope, clientText);
   const response = {
     id,
     object: "response",
@@ -465,8 +582,8 @@ function sseEvent(value, eventType = undefined) {
   return `${eventType ? `event: ${eventType}\n` : ""}data: ${JSON.stringify(value)}\n\n`;
 }
 
-export function createChatStream({ envelope, upstreamPayload, metadata = {}, model, requestId }) {
-  const response = createChatResponse({ envelope, upstreamPayload, metadata, model, requestId });
+export function createChatStream(args) {
+  const response = createChatResponse(args);
   const chunks = chunkText(response.choices[0].message.content);
   let output = "";
   chunks.forEach((content, index) => {
@@ -493,8 +610,8 @@ export function createChatStream({ envelope, upstreamPayload, metadata = {}, mod
   return output;
 }
 
-export function createResponsesStream({ envelope, upstreamPayload, metadata = {}, model, requestId }) {
-  const response = createResponsesResponse({ envelope, upstreamPayload, metadata, model, requestId });
+export function createResponsesStream(args) {
+  const response = createResponsesResponse(args);
   const message = response.output[0];
   const text = response.output_text;
   let output = "";
